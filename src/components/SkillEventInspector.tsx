@@ -618,6 +618,8 @@ function DamageEffects({ values, onChange, assets, onCreateAssets, defaultPixels
     detectionType: "rangeOverlap",
     hitLayerName: "Enemy",
     anchor: "world",
+    useFollowDuration: false,
+    followDurationTicks: 0,
     shape: "box",
     centerX: 0.8,
     centerY: 0.9,
@@ -660,6 +662,9 @@ function DamageEffects({ values, onChange, assets, onCreateAssets, defaultPixels
     {values.map((effect, index) => {
       const patch = (next: any) => onChange(values.map((item, cursor) => cursor === index ? { ...item, ...next } : item));
       const detectionType = effect.detectionType || "rangeOverlap";
+      const anchor = effect.anchor || "world";
+      const supportsFollowDuration = detectionType !== "physicalEntity" && anchor !== "world";
+      const useFollowDuration = supportsFollowDuration && Boolean(effect.useFollowDuration);
       const shape = effect.shape || "box";
       const boxGrowthEnabled = detectionType === "rangeOverlap" && shape === "box" && Boolean(effect.boxGrowthEnabled);
       const boxGrowthDirection = ["up", "down", "left", "right"].includes(effect.boxGrowthDirection) ? effect.boxGrowthDirection : "right";
@@ -698,7 +703,7 @@ function DamageEffects({ values, onChange, assets, onCreateAssets, defaultPixels
 
           {(detectionType === "rangeOverlap" || detectionType === "physicalEntity") && <>
             <div className="field-grid two-columns">
-              <SelectField label="锚点" title={detectionType === "physicalEntity" ? "自身=在施法者位置生成；目标=在当前锁定目标位置生成；世界=在事件触发时记录施法者位置。物理实体生成后均由 Rigidbody2D 独立运动" : "自身=检测期间跟随施法者；目标=检测期间跟随当前锁定目标；世界=固定在事件触发时记录的施法者位置"} value={effect.anchor || "world"} onChange={(value) => patch(value === "world" ? { anchor: value } : { anchor: value, motion: defaultMotion() })} options={[["self", "自身"], ["target", "目标"], ["world", "世界"]]} />
+              <SelectField label="锚点" title={detectionType === "physicalEntity" ? "自身=在施法者位置生成；目标=在当前锁定目标位置生成；世界=在事件触发时记录施法者位置。物理实体生成后均由 Rigidbody2D 独立运动" : "自身=检测期间跟随施法者；目标=检测期间跟随当前锁定目标；世界=固定在事件触发时记录的施法者位置"} value={anchor} onChange={(value) => patch(value === "world" ? { anchor: value, useFollowDuration: false, followDurationTicks: 0 } : { anchor: value, motion: defaultMotion() })} options={[["self", "自身"], ["target", "目标"], ["world", "世界"]]} />
               <SelectField label={detectionType === "physicalEntity" ? "实体形状" : "范围形状"} value={shape} onChange={(value) => patch({ shape: value, ...(value === "box" && detectionType === "rangeOverlap" ? {} : { boxGrowthEnabled: false }) })} options={detectionType === "physicalEntity" ? [["circle", "圆形"], ["box", "盒体"]] : [["circle", "圆形"], ["sector", "扇形"], ["box", "盒体"]]} />
               <NumberField label="中心 X" value={numeric(effect.centerX)} step={0.1} onChange={(value) => patch({ centerX: value })} />
               <NumberField label="中心 Y" value={numeric(effect.centerY)} step={0.1} onChange={(value) => patch({ centerY: value })} />
@@ -722,13 +727,17 @@ function DamageEffects({ values, onChange, assets, onCreateAssets, defaultPixels
           </>}
 
           {detectionType === "raycast" && <div className="field-grid two-columns">
-            <SelectField label="锚点" value={effect.anchor || "world"} onChange={(value) => patch(value === "self" ? { anchor: value, motion: defaultMotion() } : { anchor: value })} options={[["world", "世界"], ["self", "自身"]]} />
+            <SelectField label="锚点" value={anchor} onChange={(value) => patch(value === "self" ? { anchor: value, motion: defaultMotion() } : { anchor: value, useFollowDuration: false, followDurationTicks: 0 })} options={[["world", "世界"], ["self", "自身"]]} />
             <NumberField label="旋转" value={numeric(effect.rotation)} step={0.1} onChange={(value) => patch({ rotation: value })} />
             <NumberField label="射线起点 X" value={numeric(effect.rayOriginX)} step={0.1} onChange={(value) => patch({ rayOriginX: value })} />
             <NumberField label="射线起点 Y" value={numeric(effect.rayOriginY)} step={0.1} onChange={(value) => patch({ rayOriginY: value })} />
             <NumberField label="射线距离" value={numeric(effect.rayMaxDistance)} min={0.01} step={0.1} onChange={(value) => patch({ rayMaxDistance: value })} />
             <NumberField label="射线半径" value={numeric(effect.rayRadius)} min={0} step={0.1} onChange={(value) => patch({ rayRadius: value })} />
           </div>}
+
+          {supportsFollowDuration && <label className="toggle-row" title="启用后只在指定时长内跟随锚点；设为 0 Tick 时只读取事件触发瞬间的位置"><input type="checkbox" checked={useFollowDuration} onChange={(event) => patch({ useFollowDuration: event.target.checked })} /><span>限制跟随时长</span></label>}
+          {useFollowDuration && <NumberField label="跟随时长 Tick" title="0 Tick 表示在事件触发时锁定一次锚点位置，之后固定在该世界坐标" value={numeric(effect.followDurationTicks)} min={0} integer onChange={(value) => patch({ followDurationTicks: Math.max(0, Math.round(value)) })} />}
+          {anchor === "target" && useFollowDuration && numeric(effect.followDurationTicks) === 0 && <div className="time-readout">触发时记录目标位置，之后固定在该世界坐标</div>}
 
           {detectionType === "physicalEntity" && <>
             <div className="field-grid two-columns">

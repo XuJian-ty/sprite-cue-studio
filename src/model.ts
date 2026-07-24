@@ -561,6 +561,8 @@ export function createTimelineEvent(kind: TrackKind, startTick: number, pixelsPe
         detectionType: "rangeOverlap",
         hitLayerName: "Enemy",
         anchor: "world",
+        useFollowDuration: false,
+        followDurationTicks: 0,
         shape: "box",
         centerX: 0.8,
         centerY: 0.9,

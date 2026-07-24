@@ -522,6 +522,13 @@ function cleanLegacyProjectData(value: CharacterProject): CharacterProject {
               : "rangeOverlap";
             damageEffect.detectionDurationTicks = Math.max(0, Number(damageEffect.detectionDurationTicks) || 0);
             damageEffect.activationTick = Math.min(Math.max(0, Number(damageEffect.activationTick) || 0), damageEffect.detectionDurationTicks);
+            if ((damageEffect.anchor || "world") === "world") {
+              damageEffect.useFollowDuration = false;
+              damageEffect.followDurationTicks = 0;
+            } else {
+              damageEffect.useFollowDuration = Boolean(damageEffect.useFollowDuration);
+              damageEffect.followDurationTicks = Math.max(0, Math.round(Number(damageEffect.followDurationTicks) || 0));
+            }
             damageEffect.boxGrowthEnabled = Boolean(damageEffect.boxGrowthEnabled);
             damageEffect.boxGrowthDirection = ["up", "down", "left", "right"].includes(damageEffect.boxGrowthDirection) ? damageEffect.boxGrowthDirection : "right";
             damageEffect.boxGrowthSpeed = Number.isFinite(Number(damageEffect.boxGrowthSpeed)) ? Math.max(0, Number(damageEffect.boxGrowthSpeed)) : 4;
@@ -2363,8 +2370,10 @@ export default function App() {
               {syncDialog.phase === "overwrite" ? <>
                 <button type="button" onClick={cancelEnemyOverwrite}>取消覆盖</button>
                 <button type="button" className="primary-button" onClick={() => void confirmEnemyOverwrite()}>覆盖并同步</button>
-              </> : syncDialog.phase === "missing" || syncDialog.phase === "outdated" ? (
-                <button type="button" className="primary-button" onClick={() => void installRuntimeAndSync()}>{syncDialog.phase === "missing" ? "安装并同步" : "更新并同步"}</button>
+              </> : syncDialog.phase === "missing" ? (
+                <button type="button" className="primary-button" onClick={() => void installRuntimeAndSync()}>安装并同步</button>
+              ) : syncDialog.phase === "outdated" ? (
+                <button type="button" className="primary-button" onClick={() => void installRuntimeAndSync()}>更新 Runtime 并同步</button>
               ) : syncDialog.phase !== "done" ? (
                 <button
                   type="button"

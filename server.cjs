@@ -91,10 +91,12 @@ function sourceRuntimeInfo() {
 function runtimeStatus(root) {
   const current = runtimeInfo(root);
   const latest = sourceRuntimeInfo();
+  const sameVersion = current.installed && current.version === latest.version;
   return {
     ...current,
     latestVersion: latest.version,
-    needsUpdate: current.installed && (current.version !== latest.version || current.fingerprint !== latest.fingerprint),
+    needsUpdate: current.installed && !sameVersion,
+    hasLocalChanges: sameVersion && current.fingerprint !== latest.fingerprint,
   };
 }
 
@@ -132,12 +134,18 @@ function copyDirectory(source, target, overwrite = false) {
 
 function replaceDirectory(source, target) {
   const temp = `${target}.updating-${Date.now()}`;
-  const backup = `${target}.backup-${Date.now()}`;
+  const projectRoot = path.dirname(path.dirname(target));
+  const backupRoot = path.join(
+    projectRoot,
+    "FrameActionMigrationBackup",
+    `runtime-update-${new Date().toISOString().replace(/[:.]/g, "-")}`,
+  );
+  const backup = path.join(backupRoot, path.basename(target));
   copyDirectory(source, temp);
+  fs.mkdirSync(backupRoot, { recursive: true });
   fs.renameSync(target, backup);
   try {
     fs.renameSync(temp, target);
-    fs.rmSync(backup, { recursive: true, force: true });
   } catch (error) {
     if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
     if (fs.existsSync(backup)) fs.renameSync(backup, target);
@@ -166,7 +174,7 @@ function installRuntime(root) {
   const current = runtimeInfo(root);
   const latest = sourceRuntimeInfo();
   if (current.installed) {
-    if (current.version !== latest.version || current.fingerprint !== latest.fingerprint) replaceDirectory(RUNTIME_SOURCE, current.path);
+    if (current.version !== latest.version) replaceDirectory(RUNTIME_SOURCE, current.path);
     requestUnityRuntimeRefresh(root, latest.version);
     return runtimeStatus(root);
   }
@@ -1608,7 +1616,6 @@ const server = http.createServer(async (req, res) => {
       const root = validateUnityProject(body.projectPath);
       const runtime = runtimeStatus(root);
       if (!runtime.installed) return sendJson(res, 409, { ok: false, code: "runtime_missing", message: "Unity 项目尚未安装 Frame Action Runtime" });
-      if (runtime.needsUpdate) return sendJson(res, 409, { ok: false, code: "runtime_outdated", message: `Frame Action Runtime ${runtime.version} 需要更新到 ${runtime.latestVersion}` });
       return sendJson(res, 200, { ok: true, runtime, result: syncCharacter(root, body) });
     }
     if (req.method === "POST" && url.pathname === "/api/unity/sync-enemy") {
@@ -1616,7 +1623,6 @@ const server = http.createServer(async (req, res) => {
       const root = validateUnityProject(body.projectPath);
       const runtime = runtimeStatus(root);
       if (!runtime.installed) return sendJson(res, 409, { ok: false, code: "runtime_missing", message: "Unity 项目尚未安装 Frame Action Runtime" });
-      if (runtime.needsUpdate) return sendJson(res, 409, { ok: false, code: "runtime_outdated", message: `Frame Action Runtime ${runtime.version} 需要更新到 ${runtime.latestVersion}` });
       return sendJson(res, 200, { ok: true, runtime, result: syncCharacter(root, body, "enemy") });
     }
     if (req.method === "POST" && url.pathname === "/api/unity/characters") {
@@ -1689,7 +1695,6 @@ const server = http.createServer(async (req, res) => {
       const root = validateUnityProject(body.projectPath);
       const runtime = runtimeStatus(root);
       if (!runtime.installed) return sendJson(res, 409, { ok: false, code: "runtime_missing", message: "Unity 项目尚未安装 Frame Action Runtime" });
-      if (runtime.needsUpdate) return sendJson(res, 409, { ok: false, code: "runtime_outdated", message: `Frame Action Runtime ${runtime.version} 需要更新到 ${runtime.latestVersion}` });
       return sendJson(res, 200, { ok: true, result: startMapAssetUpload(root, body) });
     }
     if (req.method === "POST" && url.pathname === "/api/unity/map-asset-upload/chunk") {
@@ -1707,7 +1712,6 @@ const server = http.createServer(async (req, res) => {
       const root = validateUnityProject(body.projectPath);
       const runtime = runtimeStatus(root);
       if (!runtime.installed) return sendJson(res, 409, { ok: false, code: "runtime_missing", message: "Unity 项目尚未安装 Frame Action Runtime" });
-      if (runtime.needsUpdate) return sendJson(res, 409, { ok: false, code: "runtime_outdated", message: `Frame Action Runtime ${runtime.version} 需要更新到 ${runtime.latestVersion}` });
       return sendJson(res, 200, { ok: true, runtime, result: await syncMap(root, body) });
     }
 

@@ -163,6 +163,8 @@ namespace FrameAction
                 yield break;
             }
             bool follow = !worldAnchor;
+            bool limitedFollow = follow && Bool(effect, "useFollowDuration");
+            float followDuration = limitedFollow ? TicksToSeconds(Mathf.Max(0, Int(effect, "followDurationTicks"))) : float.PositiveInfinity;
             float activeDuration = TicksToSeconds(Mathf.Max(1, Int(effect, "intermittentActiveTicks", 1)));
             float inactiveDuration = TicksToSeconds(Mathf.Max(0, Int(effect, "intermittentIntervalTicks")));
             bool intermittent = String(effect, "activationMode", "continuous") == "intermittent";
@@ -187,7 +189,7 @@ namespace FrameAction
 
             do
             {
-                if (follow && liveAnchor != null)
+                if (follow && liveAnchor != null && (!limitedFollow || elapsed <= followDuration))
                 {
                     anchorPosition = liveAnchor.position;
                     anchorRotation = liveAnchor.eulerAngles.z;
@@ -685,20 +687,26 @@ namespace FrameAction
             Vector2 center = candidate + (Vector2)bounds.center - start;
             Vector2 size = new Vector2(Mathf.Max(0.02f, bounds.size.x - 0.04f), Mathf.Max(0.02f, bounds.size.y - 0.04f));
             float angle = bodyCollider.transform.eulerAngles.z;
+            ContactFilter2D contactFilter = new ContactFilter2D
+            {
+                useLayerMask = true,
+                layerMask = environmentMask,
+                useTriggers = Physics2D.queriesHitTriggers
+            };
             int count;
             CapsuleCollider2D capsule = bodyCollider as CapsuleCollider2D;
             CircleCollider2D circle = bodyCollider as CircleCollider2D;
             if (capsule != null)
             {
-                count = Physics2D.OverlapCapsuleNonAlloc(center, size, capsule.direction, angle, _teleportOverlapHits, environmentMask);
+                count = Physics2D.OverlapCapsule(center, size, capsule.direction, angle, contactFilter, _teleportOverlapHits);
             }
             else if (circle != null)
             {
-                count = Physics2D.OverlapCircleNonAlloc(center, Mathf.Max(0.01f, Mathf.Min(size.x, size.y) * 0.5f), _teleportOverlapHits, environmentMask);
+                count = Physics2D.OverlapCircle(center, Mathf.Max(0.01f, Mathf.Min(size.x, size.y) * 0.5f), contactFilter, _teleportOverlapHits);
             }
             else
             {
-                count = Physics2D.OverlapBoxNonAlloc(center, size, angle, _teleportOverlapHits, environmentMask);
+                count = Physics2D.OverlapBox(center, size, angle, contactFilter, _teleportOverlapHits);
             }
             for (int i = 0; i < count; i++)
             {

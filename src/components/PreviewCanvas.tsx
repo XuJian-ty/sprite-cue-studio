@@ -304,6 +304,12 @@ function vfxNaturalDurationTicks(effect: any, tickRate: number): number {
   return Math.max(1, vfxFrameAssetIds(effect).length) * tickRate / Math.max(1, Number(effect.fps || 12));
 }
 
+function damageAnchorTick(effect: any, detectionType: string, triggerTick: number, sampleTick: number): number {
+  const followsAnchor = detectionType !== "physicalEntity" && (effect.anchor || "world") !== "world";
+  if (!followsAnchor || !effect.useFollowDuration) return sampleTick;
+  return Math.min(sampleTick, triggerTick + Math.max(0, Number(effect.followDurationTicks || 0)));
+}
+
 function damagePreviewWindow(event: TimelineEvent, effect: any, tick: number, tickRate: number, actionEndTick: number): { start: number; hitTick: number; active: boolean } | null {
   const triggerTick = eventTriggerTick(event, tick, actionEndTick);
   if (triggerTick === null) return null;
@@ -691,14 +697,18 @@ export default function PreviewCanvas(props: Props) {
         const detectionType = effect.detectionType || "rangeOverlap";
         const anchorMode = effect.anchor || "world";
         const casterAtTrigger = evaluateCaster(triggerTick);
+        const anchorTick = damageAnchorTick(effect, detectionType, triggerTick, hitTick);
         const casterAtHit = evaluateCaster(hitTick);
+        const casterAtAnchor = evaluateCaster(anchorTick);
+        const targetAtAnchorOffset = resolveTargetPhysicsOffset(anchorTick, records);
+        const targetAtAnchor = { x: targetBase.x + targetAtAnchorOffset.x, y: targetBase.y + targetAtAnchorOffset.y };
         const fixedRepeatedAnchor = anchorMode === "world" && event.triggerMode === "repeated" && event.params.repeatedAnchorMode === "fixed";
         const anchorState = fixedRepeatedAnchor
           ? evaluateCaster(event.startTick)
           : anchorMode === "target"
-            ? { position: targetBase, facingSign: casterAtHit.facingSign }
+            ? { position: targetAtAnchor, facingSign: casterAtAnchor.facingSign }
             : anchorMode === "self" && detectionType !== "physicalEntity"
-              ? casterAtHit
+              ? casterAtAnchor
               : casterAtTrigger;
         const effectFacingSign = anchorState.facingSign;
         const motionOrigin = detectionType === "raycast"
@@ -776,14 +786,16 @@ export default function PreviewCanvas(props: Props) {
         const detectionType = effect.detectionType || "rangeOverlap";
         const anchorMode = effect.anchor || "world";
         const fixedRepeatedAnchor = anchorMode === "world" && event.triggerMode === "repeated" && event.params.repeatedAnchorMode === "fixed";
-        const followsCaster = effect.anchor === "self" && detectionType !== "physicalEntity";
+        const followsAnchor = anchorMode !== "world" && detectionType !== "physicalEntity";
         const activeCasterState = evaluateCaster(activeStart);
+        const anchorTick = damageAnchorTick(effect, detectionType, activeStart, playheadTick);
+        const anchorCasterState = evaluateCaster(anchorTick);
         const anchorState = fixedRepeatedAnchor
           ? evaluateCaster(event.startTick)
           : anchorMode === "target"
-            ? { position: targetBase, facingSign: activeCasterState.facingSign }
-          : followsCaster
-            ? casterState
+            ? { position: evaluateTarget(anchorTick).position, facingSign: anchorCasterState.facingSign }
+          : followsAnchor
+            ? anchorCasterState
             : activeCasterState;
         const anchor = anchorState.position;
         const effectFacingSign = anchorState.facingSign;
@@ -807,12 +819,14 @@ export default function PreviewCanvas(props: Props) {
         const base = { event, effect, effectIndex, detectionType, center, motionOrigin, rotation: physicalRotation, facingSign: effectFacingSign, boxWidth: growth.width, boxHeight: growth.height, activeStart, hitTick: window.hitTick, active: window.active, exists };
         const hitCasterState = evaluateCaster(window.hitTick);
         const hitCaster = hitCasterState.position;
+        const hitAnchorTick = damageAnchorTick(effect, detectionType, activeStart, window.hitTick);
+        const hitAnchorCasterState = evaluateCaster(hitAnchorTick);
         const hitAnchorState = fixedRepeatedAnchor
           ? evaluateCaster(event.startTick)
           : anchorMode === "target"
-            ? { position: targetBase, facingSign: activeCasterState.facingSign }
-          : followsCaster
-            ? hitCasterState
+            ? { position: evaluateTarget(hitAnchorTick).position, facingSign: hitAnchorCasterState.facingSign }
+          : followsAnchor
+            ? hitAnchorCasterState
             : activeCasterState;
         const hitAnchor = hitAnchorState.position;
         const hitFacingSign = hitAnchorState.facingSign;

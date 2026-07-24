@@ -43,6 +43,7 @@ namespace FrameAction
         private bool _hasPreviousFootPosition;
         private float _previousFootY;
         private float _nextGroundCrossingWarningTime;
+        private float _externalMovementMultiplier = 1f;
 
         private FrameActionEnemyMovementSettings Settings
         {
@@ -77,6 +78,11 @@ namespace FrameAction
             _hasPreviousFootPosition = false;
         }
 
+        public void SetExternalMovementMultiplier(float value)
+        {
+            _externalMovementMultiplier = Mathf.Max(0f, value);
+        }
+
         private void FixedUpdate()
         {
             FrameActionEnemyMovementSettings settings = Settings;
@@ -95,7 +101,7 @@ namespace FrameAction
             }
 
             bool actionLocked = controller != null && controller.IsActionLocked;
-            float desiredVelocity = actionLocked ? 0f : ResolveDesiredVelocity(settings);
+            float desiredVelocity = actionLocked ? 0f : ResolveDesiredVelocity(settings) * _externalMovementMultiplier;
             if (!actionLocked && controller != null && controller.MovementLocked) desiredVelocity = 0f;
             SetHorizontalVelocity(desiredVelocity, actionLocked);
             if (actionLocked)
@@ -559,7 +565,7 @@ namespace FrameAction
             }
             if (best == null)
             {
-                FrameActionController2D[] players = FindObjectsOfType<FrameActionController2D>();
+                FrameActionController2D[] players = FindObjectsByType<FrameActionController2D>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
                 for (int i = 0; i < players.Length; i++) ConsiderTarget(players[i] != null ? players[i].transform : null, settings, ref best, ref bestDistance);
             }
             target = best;

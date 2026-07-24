@@ -1142,7 +1142,7 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
       const result = await response.json();
       if (!response.ok) throw new Error(result.message || "Unity 项目检查失败");
       if (!result.runtime.installed) { setConnection({ path, phase: "missing", message: "该项目尚未安装 Frame Action Runtime。" }); return; }
-      if (result.runtime.needsUpdate) { setConnection({ path, phase: "outdated", message: `Runtime ${result.runtime.version} 需要更新到 ${result.runtime.latestVersion}。`, runtimeVersion: result.runtime.version }); return; }
+      if (result.runtime.needsUpdate) { setConnection({ path, phase: "outdated", message: `Runtime ${result.runtime.version} 可单独更新到 ${result.runtime.latestVersion}，地图数据也可以继续使用当前版本同步。`, runtimeVersion: result.runtime.version }); return; }
       await listUnityContent(path);
       setBoundMapUnityProjectPath(path);
       localStorage.setItem("frameAction.mapUnityProjectPath", path);
@@ -1165,6 +1165,18 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
       setConnection({ ...connection, phase: "ready", message: "Runtime 已安装，可以绑定地图 Prefab。", runtimeVersion: result.runtime.version });
     } catch (error) {
       setConnection({ ...connection, phase: "error", message: error instanceof Error ? error.message : "Runtime 安装失败" });
+    }
+  };
+
+  const continueWithCurrentRuntime = async () => {
+    if (!connection) return;
+    try {
+      await listUnityContent(connection.path);
+      setBoundMapUnityProjectPath(connection.path);
+      localStorage.setItem("frameAction.mapUnityProjectPath", connection.path);
+      setConnection({ ...connection, phase: "ready", message: `继续使用 Runtime ${connection.runtimeVersion || "当前版本"}，可以同步地图数据。` });
+    } catch (error) {
+      setConnection({ ...connection, phase: "error", message: error instanceof Error ? error.message : "Unity 项目连接失败" });
     }
   };
 
@@ -1606,7 +1618,7 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
       <div className="modal-actions">
         {boundMapUnityProjectPath && connection.phase !== "checking" && connection.phase !== "syncing" && <div className="sync-management-actions"><button type="button" onClick={changeMapUnityProject}><FolderOpen size={14} />更换项目</button><button type="button" className="danger-text" onClick={unbindMapUnityProject}><Unlink size={14} />解除绑定</button></div>}
         {connection.phase !== "overwrite" && <button type="button" onClick={() => { setPendingMapOverwrite(null); setConnection(null); }}>关闭</button>}
-        {connection.phase === "overwrite" ? <><button type="button" onClick={() => { setPendingMapOverwrite(null); setConnection({ ...connection, phase: "ready", message: "已取消覆盖，当前页面数据没有写入 Unity。" }); }}>取消覆盖</button><button type="button" className="primary-button" onClick={() => void syncMap(true)}>覆盖并同步</button></> : (connection.phase === "missing" || connection.phase === "outdated") ? <button type="button" className="primary-button" onClick={() => void installRuntime()}>安装并继续</button> : connection.phase !== "done" ? <button type="button" className="primary-button" disabled={!connection.path.trim() || connection.phase === "checking" || connection.phase === "syncing" || (showingBoundMapProject && !backgroundAsset)} onClick={() => showingBoundMapProject ? void syncMap() : void checkConnection()}>{connection.phase === "checking" || connection.phase === "syncing" ? "处理中..." : showingBoundMapProject ? "立即同步" : "检查并绑定"}</button> : null}
+        {connection.phase === "overwrite" ? <><button type="button" onClick={() => { setPendingMapOverwrite(null); setConnection({ ...connection, phase: "ready", message: "已取消覆盖，当前页面数据没有写入 Unity。" }); }}>取消覆盖</button><button type="button" className="primary-button" onClick={() => void syncMap(true)}>覆盖并同步</button></> : connection.phase === "missing" ? <button type="button" className="primary-button" onClick={() => void installRuntime()}>安装并继续</button> : connection.phase === "outdated" ? <><button type="button" onClick={() => void continueWithCurrentRuntime()}>使用当前 Runtime</button><button type="button" className="primary-button" onClick={() => void installRuntime()}>更新 Runtime</button></> : connection.phase !== "done" ? <button type="button" className="primary-button" disabled={!connection.path.trim() || connection.phase === "checking" || connection.phase === "syncing" || (showingBoundMapProject && !backgroundAsset)} onClick={() => showingBoundMapProject ? void syncMap() : void checkConnection()}>{connection.phase === "checking" || connection.phase === "syncing" ? "处理中..." : showingBoundMapProject ? "立即同步" : "检查并绑定"}</button> : null}
       </div>
     </div></div>}
   </div>;
