@@ -1,0 +1,12 @@
+{
+  "name": "com.frame-action.runtime",
+  "version": "0.34.15",
+  "displayName": "SpriteCue Runtime",
+  "description": "Data-driven 2D frame animation playback and time-anchored event dispatch for SpriteCue Studio.",
+  "unity": "2022.3",
+  "license": "MIT",
+  "dependencies": {
+    "com.unity.nuget.newtonsoft-json": "3.2.1",
+    "com.unity.inputsystem": "1.7.0"
+  }
+}

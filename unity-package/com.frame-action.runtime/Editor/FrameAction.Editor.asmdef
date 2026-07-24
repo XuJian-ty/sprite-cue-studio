@@ -1,0 +1,6 @@
+{
+  "name": "FrameAction.Editor",
+  "rootNamespace": "FrameAction.Editor",
+  "references": ["FrameAction.Runtime", "Unity.Newtonsoft.Json"],
+  "includePlatforms": ["Editor"]
+}

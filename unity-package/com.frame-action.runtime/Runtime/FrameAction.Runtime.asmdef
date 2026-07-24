@@ -1,0 +1,5 @@
+{
+  "name": "FrameAction.Runtime",
+  "rootNamespace": "FrameAction",
+  "references": ["Unity.Newtonsoft.Json", "Unity.InputSystem"]
+}
