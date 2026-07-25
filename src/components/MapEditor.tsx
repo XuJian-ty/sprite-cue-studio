@@ -26,6 +26,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import DeferredTextInput from "./DeferredTextInput";
+import { UNITY_RUNTIME_GIT_URL } from "../unityRuntime";
 import NumericInput from "./NumericInput";
 import { loadMapDraft, saveMapDraft } from "../mapDraftStore";
 import { readDocumentOrigin, rememberLocalDocument, rememberUnityDocument } from "../workspaceSession";
@@ -59,7 +60,7 @@ interface UnityMapPrefabSummary {
 
 interface ConnectionState {
   path: string;
-  phase: "path" | "checking" | "missing" | "outdated" | "ready" | "overwrite" | "syncing" | "done" | "error";
+  phase: "path" | "checking" | "missing" | "incompatible" | "ready" | "overwrite" | "syncing" | "done" | "error";
   message: string;
   runtimeVersion?: string;
 }
@@ -1141,42 +1142,28 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
       const response = await fetch("/api/unity/check", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectPath: path }) });
       const result = await response.json();
       if (!response.ok) throw new Error(result.message || "Unity 项目检查失败");
-      if (!result.runtime.installed) { setConnection({ path, phase: "missing", message: "该项目尚未安装 Frame Action Runtime。" }); return; }
-      if (result.runtime.needsUpdate) { setConnection({ path, phase: "outdated", message: `Runtime ${result.runtime.version} 可单独更新到 ${result.runtime.latestVersion}，地图数据也可以继续使用当前版本同步。`, runtimeVersion: result.runtime.version }); return; }
+      if (!result.runtime.installed) {
+        setConnection({ path, phase: "missing", message: "请先通过 Unity Package Manager 安装独立的 com.frame-action.runtime 包，安装完成后重新检查。" });
+        return;
+      }
+      if (!result.runtime.compatible) {
+        const supported = result.runtime.schemaMin === null || result.runtime.schemaMax === null
+          ? "兼容范围声明无效"
+          : `支持 Schema ${result.runtime.schemaMin}-${result.runtime.schemaMax}`;
+        setConnection({
+          path,
+          phase: "incompatible",
+          message: `Runtime ${result.runtime.version} ${supported}，当前工具使用 Schema ${result.runtime.schemaVersion}。请在 Unity Package Manager 中选择兼容版本。`,
+          runtimeVersion: result.runtime.version,
+        });
+        return;
+      }
       await listUnityContent(path);
       setBoundMapUnityProjectPath(path);
       localStorage.setItem("frameAction.mapUnityProjectPath", path);
       setConnection({ path, phase: "ready", message: "项目已连接，可以绑定地图 Prefab。", runtimeVersion: result.runtime.version });
     } catch (error) {
       setConnection({ path, phase: "error", message: error instanceof Error ? error.message : "Unity 项目检查失败" });
-    }
-  };
-
-  const installRuntime = async () => {
-    if (!connection) return;
-    setConnection({ ...connection, phase: "checking", message: "正在为当前地图项目安装 Frame Action Runtime..." });
-    try {
-      const response = await fetch("/api/unity/install-runtime", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectPath: connection.path }) });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.message || "Runtime 安装失败");
-      await listUnityContent(connection.path);
-      setBoundMapUnityProjectPath(connection.path);
-      localStorage.setItem("frameAction.mapUnityProjectPath", connection.path);
-      setConnection({ ...connection, phase: "ready", message: "Runtime 已安装，可以绑定地图 Prefab。", runtimeVersion: result.runtime.version });
-    } catch (error) {
-      setConnection({ ...connection, phase: "error", message: error instanceof Error ? error.message : "Runtime 安装失败" });
-    }
-  };
-
-  const continueWithCurrentRuntime = async () => {
-    if (!connection) return;
-    try {
-      await listUnityContent(connection.path);
-      setBoundMapUnityProjectPath(connection.path);
-      localStorage.setItem("frameAction.mapUnityProjectPath", connection.path);
-      setConnection({ ...connection, phase: "ready", message: `继续使用 Runtime ${connection.runtimeVersion || "当前版本"}，可以同步地图数据。` });
-    } catch (error) {
-      setConnection({ ...connection, phase: "error", message: error instanceof Error ? error.message : "Unity 项目连接失败" });
     }
   };
 
@@ -1304,8 +1291,8 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
     });
     const startResult = await startResponse.json();
     if (!startResponse.ok) {
-      if (startResult.code === "runtime_missing" || startResult.code === "runtime_outdated") {
-        setConnection({ path, phase: startResult.code === "runtime_missing" ? "missing" : "outdated", message: startResult.message });
+      if (startResult.code === "runtime_missing" || startResult.code === "runtime_incompatible") {
+        setConnection({ path, phase: startResult.code === "runtime_missing" ? "missing" : "incompatible", message: startResult.message });
       }
       throw new Error(startResult.message || `地图资源准备失败：${asset.name}`);
     }
@@ -1392,8 +1379,8 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
       });
       const result = await response.json();
       if (!response.ok) {
-        if (result.code === "runtime_missing" || result.code === "runtime_outdated") {
-          setConnection({ path, phase: result.code === "runtime_missing" ? "missing" : "outdated", message: result.message });
+        if (result.code === "runtime_missing" || result.code === "runtime_incompatible") {
+          setConnection({ path, phase: result.code === "runtime_missing" ? "missing" : "incompatible", message: result.message });
           return;
         }
         throw new Error(result.message || "地图同步失败");
@@ -1606,7 +1593,8 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
     {connection && <div className="modal-backdrop" role="presentation"><div className="modal map-sync-modal" role="dialog" aria-modal="true" aria-label="地图项目连接">
       <div className="modal-heading"><div><strong>{boundMapUnityProjectPath ? "地图项目连接" : "绑定地图项目"}</strong><span>只管理地图数据、资源和目标 Prefab</span></div><button type="button" className="icon-button" title="关闭" onClick={() => { setPendingMapOverwrite(null); setConnection(null); }}><X size={16} /></button></div>
       {showingBoundMapProject ? <div className="bound-project-card"><FolderSync size={20} /><div><strong>{projectName(boundMapUnityProjectPath)}</strong><span>{boundMapUnityProjectPath}</span></div></div> : <label className="field"><span>Unity 项目根目录</span><DeferredTextInput value={connection.path} placeholder="例如 D:\\UnityProjects\\MyGame" disabled={connection.phase === "checking" || connection.phase === "syncing"} onValueChange={(value) => setConnection({ ...connection, path: value, phase: "path" })} /></label>}
-      <div className={`sync-message ${connection.phase}`}><strong>{connection.phase === "missing" ? "需要安装 Runtime" : connection.phase === "outdated" ? "需要更新 Runtime" : connection.phase === "overwrite" ? "确认覆盖同名地图" : connection.phase === "done" ? "操作完成" : connection.phase === "error" ? "操作失败" : showingBoundMapProject ? "已绑定项目" : "项目连接"}</strong><span>{connection.message}</span>{connection.runtimeVersion && <small>Runtime {connection.runtimeVersion}</small>}</div>
+      <div className={`sync-message ${connection.phase}`}><strong>{connection.phase === "missing" ? "需要安装 Runtime" : connection.phase === "incompatible" ? "Runtime 不兼容" : connection.phase === "overwrite" ? "确认覆盖同名地图" : connection.phase === "done" ? "操作完成" : connection.phase === "error" ? "操作失败" : showingBoundMapProject ? "已绑定项目" : "项目连接"}</strong><span>{connection.message}</span>{connection.runtimeVersion && <small>Runtime {connection.runtimeVersion}</small>}</div>
+      {(connection.phase === "missing" || connection.phase === "incompatible") && <div className="runtime-summary"><span>包名：com.frame-action.runtime</span><code className="runtime-package-url">{UNITY_RUNTIME_GIT_URL}</code><span>SpriteCue 只检查 Schema，不会安装或覆盖 Runtime</span></div>}
       {showingBoundMapProject && <>
         <div className="unity-character-loader">
           <div className="section-heading"><div><strong>打开已同步地图</strong><span>{unityMaps.length} 个</span></div><button type="button" className="create-enemy-button" onClick={createNewMap}><Plus size={14} />创建新地图</button></div>
@@ -1618,7 +1606,7 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
       <div className="modal-actions">
         {boundMapUnityProjectPath && connection.phase !== "checking" && connection.phase !== "syncing" && <div className="sync-management-actions"><button type="button" onClick={changeMapUnityProject}><FolderOpen size={14} />更换项目</button><button type="button" className="danger-text" onClick={unbindMapUnityProject}><Unlink size={14} />解除绑定</button></div>}
         {connection.phase !== "overwrite" && <button type="button" onClick={() => { setPendingMapOverwrite(null); setConnection(null); }}>关闭</button>}
-        {connection.phase === "overwrite" ? <><button type="button" onClick={() => { setPendingMapOverwrite(null); setConnection({ ...connection, phase: "ready", message: "已取消覆盖，当前页面数据没有写入 Unity。" }); }}>取消覆盖</button><button type="button" className="primary-button" onClick={() => void syncMap(true)}>覆盖并同步</button></> : connection.phase === "missing" ? <button type="button" className="primary-button" onClick={() => void installRuntime()}>安装并继续</button> : connection.phase === "outdated" ? <><button type="button" onClick={() => void continueWithCurrentRuntime()}>使用当前 Runtime</button><button type="button" className="primary-button" onClick={() => void installRuntime()}>更新 Runtime</button></> : connection.phase !== "done" ? <button type="button" className="primary-button" disabled={!connection.path.trim() || connection.phase === "checking" || connection.phase === "syncing" || (showingBoundMapProject && !backgroundAsset)} onClick={() => showingBoundMapProject ? void syncMap() : void checkConnection()}>{connection.phase === "checking" || connection.phase === "syncing" ? "处理中..." : showingBoundMapProject ? "立即同步" : "检查并绑定"}</button> : null}
+        {connection.phase === "overwrite" ? <><button type="button" onClick={() => { setPendingMapOverwrite(null); setConnection({ ...connection, phase: "ready", message: "已取消覆盖，当前页面数据没有写入 Unity。" }); }}>取消覆盖</button><button type="button" className="primary-button" onClick={() => void syncMap(true)}>覆盖并同步</button></> : connection.phase === "missing" || connection.phase === "incompatible" ? <button type="button" className="primary-button" onClick={() => void checkConnection()}>重新检查</button> : connection.phase !== "done" ? <button type="button" className="primary-button" disabled={!connection.path.trim() || connection.phase === "checking" || connection.phase === "syncing" || (showingBoundMapProject && !backgroundAsset)} onClick={() => showingBoundMapProject ? void syncMap() : void checkConnection()}>{connection.phase === "checking" || connection.phase === "syncing" ? "处理中..." : showingBoundMapProject ? "立即同步" : "检查并绑定"}</button> : null}
       </div>
     </div></div>}
   </div>;

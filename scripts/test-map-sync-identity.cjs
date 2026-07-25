@@ -56,10 +56,15 @@ function backgroundAsset() {
     pngDataUrl = `data:image/png;base64,${pngBuffer.toString("base64")}`;
     byteSize = pngBuffer.length;
     fs.mkdirSync(path.join(testRoot, "Assets"), { recursive: true });
-    fs.mkdirSync(path.join(testRoot, "Packages"), { recursive: true });
+    const runtimeRoot = path.join(testRoot, "Packages", "com.frame-action.runtime");
+    fs.mkdirSync(runtimeRoot, { recursive: true });
     fs.mkdirSync(path.join(testRoot, "ProjectSettings"), { recursive: true });
     fs.writeFileSync(path.join(testRoot, "ProjectSettings", "ProjectVersion.txt"), "m_EditorVersion: 6000.0.0f1\n");
-    await post("/api/unity/install-runtime", { projectPath: testRoot });
+    fs.writeFileSync(path.join(runtimeRoot, "package.json"), `${JSON.stringify({
+      name: "com.frame-action.runtime",
+      version: "test",
+      frameAction: { schemaMin: 6, schemaMax: 6 },
+    }, null, 2)}\n`);
 
     const first = await post("/api/unity/sync-map", { projectPath: testRoot, project: mapProject("地图甲"), assets: [backgroundAsset()] });
     await post("/api/unity/sync-map", { projectPath: testRoot, project: mapProject("地图甲"), assets: [backgroundAsset()] }, 409);

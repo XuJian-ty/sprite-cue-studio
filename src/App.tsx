@@ -42,6 +42,7 @@ import PreviewCanvas from "./components/PreviewCanvas";
 import SkillEventInspector from "./components/SkillEventInspector";
 import Timeline from "./components/Timeline";
 import MapEditor from "./components/MapEditor";
+import { UNITY_RUNTIME_GIT_URL } from "./unityRuntime";
 import {
   activeEvents,
   actionTimelineDuration,
@@ -52,10 +53,6 @@ import {
   createEnemyMovementSettings,
   createEnemyProject,
   createEnemySkillSettings,
-  createWolfBossBehaviorSettings,
-  ensureWolfBossCombo4TeleportSteps,
-  ensureWolfBossExtraCombos,
-  ensureWolfBossSkillActions,
   createFrame,
   createMotorSettings,
   createProject,
@@ -126,7 +123,7 @@ interface SheetDialogState {
 
 interface SyncDialogState {
   path: string;
-  phase: "path" | "checking" | "missing" | "outdated" | "syncing" | "overwrite" | "done" | "error";
+  phase: "path" | "checking" | "missing" | "incompatible" | "syncing" | "overwrite" | "done" | "error";
   message: string;
   runtimeVersion?: string;
   editingPath?: boolean;
@@ -401,7 +398,6 @@ function cleanLegacyProjectData(value: CharacterProject): CharacterProject {
     project.motor.enableInput = false;
     project.motor.enableMotor = false;
     project.cameraFollow.enabled = false;
-    if (project.characterName === "狼妖Boss") ensureWolfBossSkillActions(project.actions);
     const defaultBehavior = createEnemyBehaviorSettings();
     const behavior = { ...defaultBehavior, ...(project.enemyBehavior || {}) };
     behavior.playGroundIdleOnEnable = behavior.playGroundIdleOnEnable !== false;
@@ -458,14 +454,6 @@ function cleanLegacyProjectData(value: CharacterProject): CharacterProject {
       }));
       if (behavior.nodes.every((node) => node.positionX === 0 && node.positionY === 0)) layoutEnemyBehaviorNodes(behavior);
       project.enemyBehavior = behavior;
-    }
-    if (project.characterName === "狼妖Boss" && (project.enemyBehavior?.rootNodeId === "wolf-ai-root"
-      || !project.enemyBehavior?.nodes.some((node) => node.id === "wolf-combo-5"))) {
-      project.enemyBehavior = createWolfBossBehaviorSettings(project.enemyBehavior, project.actions);
-    }
-    if (project.characterName === "狼妖Boss" && project.enemyBehavior) {
-      project.enemyBehavior = ensureWolfBossCombo4TeleportSteps(project.enemyBehavior, project.actions);
-      project.enemyBehavior = ensureWolfBossExtraCombos(project.enemyBehavior, project.actions);
     }
   }
   for (const action of project.actions) {
@@ -1745,18 +1733,34 @@ export default function App() {
     try {
       const result = await postJson<{
         ok: true;
-        runtime: { installed: boolean; version: string | null; latestVersion: string; needsUpdate: boolean };
+        runtime: {
+          installed: boolean;
+          version: string | null;
+          schemaVersion: number;
+          schemaMin: number | null;
+          schemaMax: number | null;
+          compatible: boolean;
+        };
       }>("/api/unity/check", { projectPath });
       if (!result.runtime.installed) {
-        setSyncDialog({ path: projectPath, phase: "missing", editingPath: false, message: "该项目尚未安装 Frame Action Runtime。", runtimeVersion: undefined });
-        return;
-      }
-      if (result.runtime.needsUpdate) {
         setSyncDialog({
           path: projectPath,
-          phase: "outdated",
+          phase: "missing",
           editingPath: false,
-          message: `当前 Runtime ${result.runtime.version}，需要更新到 ${result.runtime.latestVersion} 后再同步。`,
+          message: "请先通过 Unity Package Manager 安装独立的 com.frame-action.runtime 包，安装完成后重新检查。",
+          runtimeVersion: undefined,
+        });
+        return;
+      }
+      if (!result.runtime.compatible) {
+        const supported = result.runtime.schemaMin === null || result.runtime.schemaMax === null
+          ? "兼容范围声明无效"
+          : `支持 Schema ${result.runtime.schemaMin}-${result.runtime.schemaMax}`;
+        setSyncDialog({
+          path: projectPath,
+          phase: "incompatible",
+          editingPath: false,
+          message: `Runtime ${result.runtime.version} ${supported}，当前工具使用 Schema ${result.runtime.schemaVersion}。请在 Unity Package Manager 中选择兼容版本。`,
           runtimeVersion: result.runtime.version ?? undefined,
         });
         return;
@@ -1764,19 +1768,6 @@ export default function App() {
       await syncUnityData(projectPath);
     } catch (error) {
       setSyncDialog({ path: projectPath, phase: "error", editingPath: true, message: error instanceof Error ? error.message : "Unity 项目检查失败" });
-    }
-  };
-
-  const installRuntimeAndSync = async () => {
-    if (!syncDialog) return;
-    const projectPath = syncDialog.path;
-    setSyncDialog({ ...syncDialog, phase: "checking", message: "正在安装 Embedded UPM Runtime..." });
-    try {
-      const result = await postJson<{ ok: true; runtime: { version: string } }>("/api/unity/install-runtime", { projectPath });
-      setSyncDialog({ path: projectPath, phase: "syncing", editingPath: false, message: `Runtime ${result.runtime.version} 已安装，正在同步数据...`, runtimeVersion: result.runtime.version });
-      await syncUnityData(projectPath);
-    } catch (error) {
-      setSyncDialog({ path: projectPath, phase: "error", editingPath: false, message: error instanceof Error ? error.message : "Runtime 安装失败" });
     }
   };
 
@@ -2316,7 +2307,7 @@ export default function App() {
               </label>
             )}
             <div className={`sync-message ${syncDialog.phase}`}>
-              <strong>{syncDialog.phase === "missing" ? "需要安装 Runtime" : syncDialog.phase === "outdated" ? "需要更新 Runtime" : syncDialog.phase === "overwrite" ? `确认覆盖同名${isEnemy ? "敌人" : "角色"}` : syncDialog.phase === "done" ? "同步完成" : syncDialog.phase === "error" ? "操作失败" : showingBoundUnityProject ? "已绑定项目" : "项目连接"}</strong>
+              <strong>{syncDialog.phase === "missing" ? "需要安装 Runtime" : syncDialog.phase === "incompatible" ? "Runtime 不兼容" : syncDialog.phase === "overwrite" ? `确认覆盖同名${isEnemy ? "敌人" : "角色"}` : syncDialog.phase === "done" ? "同步完成" : syncDialog.phase === "error" ? "操作失败" : showingBoundUnityProject ? "已绑定项目" : "项目连接"}</strong>
               <span>{syncDialog.message}</span>
               {syncDialog.runtimeVersion && <small>Runtime {syncDialog.runtimeVersion}</small>}
             </div>
@@ -2358,11 +2349,12 @@ export default function App() {
                 </div>}
               </div>
             )}
-            {(syncDialog.phase === "missing" || syncDialog.phase === "outdated") && (
+            {(syncDialog.phase === "missing" || syncDialog.phase === "incompatible") && (
               <div className="runtime-summary">
-                <span>安装位置：Packages/com.frame-action.runtime</span>
-                <span>内容：帧动画播放器、时间事件分发、Editor 数据导入器</span>
-                <span>不会修改项目业务代码，也不包含生命值、伤害计算或死亡逻辑</span>
+                <span>包名：com.frame-action.runtime</span>
+                <code className="runtime-package-url">{UNITY_RUNTIME_GIT_URL}</code>
+                <span>安装与升级由 Unity Package Manager 管理</span>
+                <span>SpriteCue 只检查 Schema 兼容性，不会写入或覆盖 Runtime 文件</span>
               </div>
             )}
             <div className="modal-actions">
@@ -2374,10 +2366,8 @@ export default function App() {
               {syncDialog.phase === "overwrite" ? <>
                 <button type="button" onClick={cancelEnemyOverwrite}>取消覆盖</button>
                 <button type="button" className="primary-button" onClick={() => void confirmEnemyOverwrite()}>覆盖并同步</button>
-              </> : syncDialog.phase === "missing" ? (
-                <button type="button" className="primary-button" onClick={() => void installRuntimeAndSync()}>安装并同步</button>
-              ) : syncDialog.phase === "outdated" ? (
-                <button type="button" className="primary-button" onClick={() => void installRuntimeAndSync()}>更新 Runtime 并同步</button>
+              </> : syncDialog.phase === "missing" || syncDialog.phase === "incompatible" ? (
+                <button type="button" className="primary-button" onClick={() => void checkAndSyncUnity()}>重新检查</button>
               ) : syncDialog.phase !== "done" ? (
                 <button
                   type="button"

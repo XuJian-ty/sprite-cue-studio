@@ -1721,7 +1721,7 @@ body.resizing-row * {
 }
 
 .sync-message.missing,
-.sync-message.outdated,
+.sync-message.incompatible,
 .sync-message.overwrite {
   border-left-color: var(--amber);
   background: #f8f1dc;
@@ -1762,6 +1762,13 @@ body.resizing-row * {
   background: #fff;
   color: #5a625e;
   font-size: 11px;
+}
+
+.runtime-package-url {
+  color: #315d73;
+  font-family: Consolas, "Courier New", monospace;
+  overflow-wrap: anywhere;
+  user-select: all;
 }
 
 .transition-editor-list,

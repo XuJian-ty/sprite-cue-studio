@@ -6,7 +6,8 @@ const sharp = require("sharp");
 
 const ROOT = __dirname;
 const DIST = path.join(ROOT, "dist");
-const RUNTIME_SOURCE = path.join(ROOT, "unity-package", "com.frame-action.runtime");
+const PROJECT_SCHEMA_VERSION = 6;
+const RUNTIME_PACKAGE_NAME = "com.frame-action.runtime";
 const PORT = Number(process.env.PORT || 5188);
 const JSON_BODY_LIMIT = 150 * 1024 * 1024;
 const MAP_ASSET_CHUNK_LIMIT = 8 * 1024 * 1024;
@@ -71,124 +72,90 @@ function validateUnityProject(projectPath) {
   return root;
 }
 
-function runtimeInfo(root) {
-  const runtimePath = path.join(root, "Packages", "com.frame-action.runtime");
-  const manifestPath = path.join(runtimePath, "package.json");
-  if (!fs.existsSync(manifestPath)) return { installed: false, path: runtimePath, version: null };
-  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-  if (manifest.name !== "com.frame-action.runtime") {
-    throw new Error("Runtime 目标目录已存在，但不是 Frame Action Runtime");
+function findRuntimeManifest(root) {
+  const candidates = [path.join(root, "Packages", RUNTIME_PACKAGE_NAME, "package.json")];
+  const projectManifestPath = path.join(root, "Packages", "manifest.json");
+  if (fs.existsSync(projectManifestPath)) {
+    const projectManifest = JSON.parse(fs.readFileSync(projectManifestPath, "utf8"));
+    const dependency = projectManifest?.dependencies?.[RUNTIME_PACKAGE_NAME];
+    if (typeof dependency === "string" && dependency.startsWith("file:")) {
+      const localPath = decodeURIComponent(dependency.slice("file:".length));
+      if (path.isAbsolute(localPath)) candidates.push(path.join(localPath, "package.json"));
+      else {
+        candidates.push(path.resolve(root, localPath, "package.json"));
+        candidates.push(path.resolve(root, "Packages", localPath, "package.json"));
+      }
+    }
   }
-  return { installed: true, path: runtimePath, version: manifest.version || "unknown", fingerprint: runtimeFingerprint(runtimePath) };
+  const packageCache = path.join(root, "Library", "PackageCache");
+  if (fs.existsSync(packageCache)) {
+    for (const entry of fs.readdirSync(packageCache, { withFileTypes: true })) {
+      if (entry.isDirectory() && (entry.name === RUNTIME_PACKAGE_NAME || entry.name.startsWith(`${RUNTIME_PACKAGE_NAME}@`))) {
+        candidates.push(path.join(packageCache, entry.name, "package.json"));
+      }
+    }
+  }
+  return candidates.find((candidate) => fs.existsSync(candidate)) || null;
 }
 
-function sourceRuntimeInfo() {
-  const manifest = JSON.parse(fs.readFileSync(path.join(RUNTIME_SOURCE, "package.json"), "utf8"));
-  if (manifest.name !== "com.frame-action.runtime") throw new Error("内置 Runtime package.json 校验失败");
-  return { version: manifest.version || "unknown", fingerprint: runtimeFingerprint(RUNTIME_SOURCE) };
+function runtimeInfo(root) {
+  const fallbackPath = path.join(root, "Packages", RUNTIME_PACKAGE_NAME);
+  const manifestPath = findRuntimeManifest(root);
+  if (!manifestPath) {
+    return {
+      installed: false,
+      path: fallbackPath,
+      version: null,
+      schemaVersion: PROJECT_SCHEMA_VERSION,
+      schemaMin: null,
+      schemaMax: null,
+      compatibilityKnown: false,
+      compatible: false,
+    };
+  }
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  if (manifest.name !== RUNTIME_PACKAGE_NAME) {
+    throw new Error("检测到的 Runtime package.json 名称无效");
+  }
+  const compatibility = manifest.frameAction && typeof manifest.frameAction === "object" ? manifest.frameAction : {};
+  const hasSchemaDeclaration = Object.hasOwn(compatibility, "schemaMin") || Object.hasOwn(compatibility, "schemaMax");
+  const schemaMin = Number(compatibility.schemaMin);
+  const schemaMax = Number(compatibility.schemaMax);
+  const validSchemaRange = Number.isInteger(schemaMin) && Number.isInteger(schemaMax) && schemaMin > 0 && schemaMax >= schemaMin;
+  return {
+    installed: true,
+    path: path.dirname(manifestPath),
+    version: manifest.version || "unknown",
+    schemaVersion: PROJECT_SCHEMA_VERSION,
+    schemaMin: validSchemaRange ? schemaMin : null,
+    schemaMax: validSchemaRange ? schemaMax : null,
+    compatibilityKnown: validSchemaRange,
+    compatible: !hasSchemaDeclaration || (validSchemaRange && PROJECT_SCHEMA_VERSION >= schemaMin && PROJECT_SCHEMA_VERSION <= schemaMax),
+  };
 }
 
 function runtimeStatus(root) {
-  const current = runtimeInfo(root);
-  const latest = sourceRuntimeInfo();
-  const sameVersion = current.installed && current.version === latest.version;
-  return {
-    ...current,
-    latestVersion: latest.version,
-    needsUpdate: current.installed && !sameVersion,
-    hasLocalChanges: sameVersion && current.fingerprint !== latest.fingerprint,
-  };
+  return runtimeInfo(root);
 }
 
-function runtimeFingerprint(root) {
-  if (!fs.existsSync(root)) return null;
-  const hash = crypto.createHash("sha256");
-  const visit = (directory, relativeRoot) => {
-    const entries = fs.readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
-    for (const entry of entries) {
-      const absolutePath = path.join(directory, entry.name);
-      const relativePath = path.join(relativeRoot, entry.name).replace(/\\/g, "/");
-      if (entry.isDirectory()) {
-        visit(absolutePath, relativePath);
-      } else if (entry.isFile()) {
-        hash.update(relativePath);
-        hash.update("\0");
-        hash.update(fs.readFileSync(absolutePath));
-        hash.update("\0");
-      }
-    }
-  };
-  visit(root, "");
-  return hash.digest("hex");
-}
-
-function copyDirectory(source, target, overwrite = false) {
-  fs.mkdirSync(target, { recursive: true });
-  for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
-    const sourcePath = path.join(source, entry.name);
-    const targetPath = path.join(target, entry.name);
-    if (entry.isDirectory()) copyDirectory(sourcePath, targetPath, overwrite);
-    else if (entry.isFile()) fs.copyFileSync(sourcePath, targetPath, overwrite ? 0 : fs.constants.COPYFILE_EXCL);
-  }
-}
-
-function replaceDirectory(source, target) {
-  const temp = `${target}.updating-${Date.now()}`;
-  const projectRoot = path.dirname(path.dirname(target));
-  const backupRoot = path.join(
-    projectRoot,
-    "FrameActionMigrationBackup",
-    `runtime-update-${new Date().toISOString().replace(/[:.]/g, "-")}`,
-  );
-  const backup = path.join(backupRoot, path.basename(target));
-  copyDirectory(source, temp);
-  fs.mkdirSync(backupRoot, { recursive: true });
-  fs.renameSync(target, backup);
-  try {
-    fs.renameSync(temp, target);
-  } catch (error) {
-    if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
-    if (fs.existsSync(backup)) fs.renameSync(backup, target);
-    if (fs.existsSync(temp)) fs.rmSync(temp, { recursive: true, force: true });
+function requireCompatibleRuntime(root) {
+  const runtime = runtimeStatus(root);
+  if (!runtime.installed) {
+    const error = new Error("Unity 项目尚未安装 Frame Action Runtime，请通过 Unity Package Manager 安装后重新检查");
+    error.statusCode = 409;
+    error.code = "runtime_missing";
     throw error;
   }
-}
-
-function requestUnityRuntimeRefresh(root, version) {
-  const packageManifest = path.join(root, "Packages", "com.frame-action.runtime", "package.json");
-  if (fs.existsSync(packageManifest)) {
-    const now = new Date();
-    fs.utimesSync(packageManifest, now, now);
+  if (!runtime.compatible) {
+    const supported = runtime.schemaMin === null || runtime.schemaMax === null
+      ? "兼容范围声明无效"
+      : `仅支持 Schema ${runtime.schemaMin}-${runtime.schemaMax}`;
+    const error = new Error(`Runtime ${runtime.version} ${supported}，当前工具使用 Schema ${PROJECT_SCHEMA_VERSION}`);
+    error.statusCode = 409;
+    error.code = "runtime_incompatible";
+    throw error;
   }
-
-  // AssetDatabase watches Assets more reliably than embedded package files while the
-  // Editor is open. This harmless marker makes the refresh request survive until the
-  // current Play session exits, then Unity recompiles the package automatically.
-  const marker = path.join(root, "Assets", "FrameActionData", ".frame-action-runtime-refresh.txt");
-  fs.mkdirSync(path.dirname(marker), { recursive: true });
-  fs.writeFileSync(marker, `Frame Action Runtime ${version}\n`, "utf8");
-}
-
-function installRuntime(root) {
-  if (!fs.existsSync(RUNTIME_SOURCE)) throw new Error("工具内置的 Unity Runtime 不完整");
-  const current = runtimeInfo(root);
-  const latest = sourceRuntimeInfo();
-  if (current.installed) {
-    if (current.version !== latest.version) replaceDirectory(RUNTIME_SOURCE, current.path);
-    requestUnityRuntimeRefresh(root, latest.version);
-    return runtimeStatus(root);
-  }
-  const target = current.path;
-  const temp = `${target}.installing-${Date.now()}`;
-  copyDirectory(RUNTIME_SOURCE, temp);
-  const copiedManifest = JSON.parse(fs.readFileSync(path.join(temp, "package.json"), "utf8"));
-  if (copiedManifest.name !== "com.frame-action.runtime") {
-    fs.rmSync(temp, { recursive: true, force: true });
-    throw new Error("内置 Runtime package.json 校验失败");
-  }
-  fs.renameSync(temp, target);
-  requestUnityRuntimeRefresh(root, latest.version);
-  return runtimeStatus(root);
+  return runtime;
 }
 
 function safeName(value, fallback) {
@@ -600,79 +567,6 @@ function layoutEnemyBehaviorNodes(rootNodeId, nodes) {
   }
 }
 
-function ensureWolfBossExtraCombos(project) {
-  if (project.characterName !== "狼妖Boss" || !Array.isArray(project.actions) || !Array.isArray(project.enemyBehavior?.nodes)) return;
-  const findAction = (id, name) => project.actions.find((action) => action?.id === id)
-    || project.actions.find((action) => String(action?.name || "").includes(name));
-  const teleport = findAction("skill-teleport", "瞬移");
-  const beam = findAction("skill-lightning-beam", "雷电光束");
-  const charge = findAction("skill-charge-knockback", "冲锋撞击");
-  const summon = findAction("skill-summon-lightning", "召唤落雷");
-  const nodes = project.enemyBehavior.nodes;
-  if (!teleport || !beam || !charge || !summon || !nodes.some((node) => node?.id === "wolf-combo-random")) return;
-
-  const byId = new Map(nodes.filter(Boolean).map((node) => [node.id, node]));
-  let changed = false;
-  const upsert = (id, name, type, parentId, order, patch = {}) => {
-    let node = byId.get(id);
-    if (!node) {
-      node = {
-        id,
-        parentId,
-        order,
-        name,
-        type,
-        conditionKey: "hasTarget",
-        comparison: "isTrue",
-        numberValue: 0,
-        stringValue: "",
-        actionId: "",
-        waitUntilComplete: true,
-        ignoreSkillCooldown: false,
-        durationSeconds: 0.5,
-        taskKey: "moveToTarget",
-        positionX: 0,
-        positionY: 0,
-      };
-      nodes.push(node);
-      byId.set(id, node);
-      changed = true;
-    }
-    const before = JSON.stringify(node);
-    Object.assign(node, { name, type, parentId, order }, patch);
-    if (JSON.stringify(node) !== before) changed = true;
-    return node;
-  };
-  const addCombo = (index, name, steps) => {
-    const cooldownId = `wolf-combo-${index}-cooldown`;
-    const sequenceId = `wolf-combo-${index}`;
-    upsert(cooldownId, `${name}冷却`, "cooldown", "wolf-combo-random", index - 1, { durationSeconds: 10 });
-    upsert(sequenceId, name, "sequence", cooldownId, 0);
-    upsert(`wolf-combo-${index}-target`, "已发现目标", "condition", sequenceId, 0, { conditionKey: "hasTarget", comparison: "isTrue" });
-    upsert(`wolf-combo-${index}-stop`, "连招前停止", "customTask", sequenceId, 1, { taskKey: "stop" });
-    upsert(`wolf-combo-${index}-face`, "面向玩家", "customTask", sequenceId, 2, { taskKey: "faceTarget" });
-    steps.forEach((step, stepIndex) => {
-      upsert(step.id, step.name, "playAction", sequenceId, stepIndex + 3, {
-        actionId: step.actionId,
-        waitUntilComplete: true,
-        ignoreSkillCooldown: true,
-      });
-    });
-  };
-
-  addCombo(6, "瞬移接雷电光束接召唤落雷", [
-    { id: "wolf-combo-6-teleport", name: "瞬移", actionId: teleport.id },
-    { id: "wolf-combo-6-beam", name: "雷电光束", actionId: beam.id },
-    { id: "wolf-combo-6-summon", name: "召唤落雷", actionId: summon.id },
-  ]);
-  addCombo(7, "瞬移接冲锋撞击接召唤落雷", [
-    { id: "wolf-combo-7-teleport", name: "瞬移", actionId: teleport.id },
-    { id: "wolf-combo-7-charge", name: "冲锋撞击", actionId: charge.id },
-    { id: "wolf-combo-7-summon", name: "召唤落雷", actionId: summon.id },
-  ]);
-  if (changed) layoutEnemyBehaviorNodes(project.enemyBehavior.rootNodeId, nodes);
-}
-
 function migrateCharacterProject(value) {
   if (!value || typeof value !== "object") return value;
   const project = JSON.parse(JSON.stringify(value));
@@ -827,65 +721,6 @@ function migrateCharacterProject(value) {
       rootNodeId: behaviorRootId,
       nodes: behaviorNodes,
     };
-    if (project.characterName === "狼妖Boss") {
-      const teleportAction = actions.find((action) => action?.id === "skill-teleport")
-        || actions.find((action) => String(action?.name || "").includes("瞬移"));
-      const combo4 = project.enemyBehavior.nodes.find((node) => node?.id === "wolf-combo-4");
-      if (teleportAction && combo4) {
-        const byId = new Map(project.enemyBehavior.nodes.filter(Boolean).map((node) => [node.id, node]));
-        const charge1 = byId.get("wolf-combo-4-charge-1");
-        const baseX = Number(charge1?.positionX) || 0;
-        const baseY = Number(charge1?.positionY) || 0;
-        const upsertTeleport = (id, name, order, positionX) => {
-          let node = byId.get(id);
-          if (!node) {
-            node = {
-              id,
-              parentId: "wolf-combo-4",
-              order,
-              name,
-              type: "playAction",
-              conditionKey: "hasTarget",
-              comparison: "isTrue",
-              numberValue: 0,
-              stringValue: "",
-              actionId: teleportAction.id,
-              waitUntilComplete: true,
-              ignoreSkillCooldown: true,
-              durationSeconds: 0.5,
-              taskKey: "moveToTarget",
-              positionX,
-              positionY: baseY,
-            };
-            project.enemyBehavior.nodes.push(node);
-            byId.set(id, node);
-          }
-          node.parentId = "wolf-combo-4";
-          node.order = order;
-          node.name = name;
-          node.type = "playAction";
-          node.actionId = teleportAction.id;
-          node.waitUntilComplete = true;
-          node.ignoreSkillCooldown = true;
-          node.positionX = positionX;
-          node.positionY = baseY;
-        };
-        const updateStep = (id, order, positionX) => {
-          const node = byId.get(id);
-          if (!node) return;
-          node.order = order;
-          node.positionX = positionX;
-          node.positionY = baseY;
-        };
-        upsertTeleport("wolf-combo-4-teleport-1", "第一次转向前瞬移", 4, baseX + 230);
-        updateStep("wolf-combo-4-turn-1", 5, baseX + 460);
-        updateStep("wolf-combo-4-charge-2", 6, baseX + 690);
-        upsertTeleport("wolf-combo-4-teleport-2", "第二次转向前瞬移", 7, baseX + 920);
-        updateStep("wolf-combo-4-turn-2", 8, baseX + 1150);
-        updateStep("wolf-combo-4-charge-3", 9, baseX + 1380);
-      }
-      ensureWolfBossExtraCombos(project);
-    }
     for (const action of actions) {
       if (!action) continue;
       action.trigger = { type: "none", code: "" };
@@ -1680,23 +1515,16 @@ const server = http.createServer(async (req, res) => {
       const root = validateUnityProject(body.projectPath);
       return sendJson(res, 200, { ok: true, projectPath: root, runtime: runtimeStatus(root) });
     }
-    if (req.method === "POST" && url.pathname === "/api/unity/install-runtime") {
-      const body = await readBody(req);
-      const root = validateUnityProject(body.projectPath);
-      return sendJson(res, 200, { ok: true, runtime: installRuntime(root) });
-    }
     if (req.method === "POST" && url.pathname === "/api/unity/sync") {
       const body = await readBody(req);
       const root = validateUnityProject(body.projectPath);
-      const runtime = runtimeStatus(root);
-      if (!runtime.installed) return sendJson(res, 409, { ok: false, code: "runtime_missing", message: "Unity 项目尚未安装 Frame Action Runtime" });
+      const runtime = requireCompatibleRuntime(root);
       return sendJson(res, 200, { ok: true, runtime, result: syncCharacter(root, body) });
     }
     if (req.method === "POST" && url.pathname === "/api/unity/sync-enemy") {
       const body = await readBody(req);
       const root = validateUnityProject(body.projectPath);
-      const runtime = runtimeStatus(root);
-      if (!runtime.installed) return sendJson(res, 409, { ok: false, code: "runtime_missing", message: "Unity 项目尚未安装 Frame Action Runtime" });
+      const runtime = requireCompatibleRuntime(root);
       return sendJson(res, 200, { ok: true, runtime, result: syncCharacter(root, body, "enemy") });
     }
     if (req.method === "POST" && url.pathname === "/api/unity/characters") {
@@ -1767,8 +1595,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/unity/map-asset-upload/start") {
       const body = await readBody(req);
       const root = validateUnityProject(body.projectPath);
-      const runtime = runtimeStatus(root);
-      if (!runtime.installed) return sendJson(res, 409, { ok: false, code: "runtime_missing", message: "Unity 项目尚未安装 Frame Action Runtime" });
+      requireCompatibleRuntime(root);
       return sendJson(res, 200, { ok: true, result: startMapAssetUpload(root, body) });
     }
     if (req.method === "POST" && url.pathname === "/api/unity/map-asset-upload/chunk") {
@@ -1784,9 +1611,12 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/unity/sync-map") {
       const body = await readBody(req);
       const root = validateUnityProject(body.projectPath);
-      const runtime = runtimeStatus(root);
-      if (!runtime.installed) return sendJson(res, 409, { ok: false, code: "runtime_missing", message: "Unity 项目尚未安装 Frame Action Runtime" });
+      const runtime = requireCompatibleRuntime(root);
       return sendJson(res, 200, { ok: true, runtime, result: await syncMap(root, body) });
+    }
+
+    if (url.pathname.startsWith("/api/")) {
+      return sendJson(res, 404, { ok: false, code: "api_not_found", message: "接口不存在" });
     }
 
     if (!fs.existsSync(DIST)) return sendJson(res, 503, { ok: false, message: "dist 不存在，请先运行 npm run build" });
@@ -1798,7 +1628,11 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { "Content-Type": contentType(filePath), "Cache-Control": filePath.endsWith("index.html") ? "no-cache" : "public, max-age=3600" });
     res.end(contents);
   } catch (error) {
-    sendJson(res, Number(error.statusCode) || 400, { ok: false, message: error.message || "请求失败" });
+    sendJson(res, Number(error.statusCode) || 400, {
+      ok: false,
+      ...(error.code ? { code: error.code } : {}),
+      message: error.message || "请求失败",
+    });
   }
 });
 
