@@ -1,6 +1,6 @@
 {
   "name": "com.frame-action.runtime",
-  "version": "0.34.17",
+  "version": "0.34.18",
   "displayName": "SpriteCue Runtime",
   "description": "Data-driven 2D frame animation playback and time-anchored event dispatch for SpriteCue Studio.",
   "unity": "2022.3",

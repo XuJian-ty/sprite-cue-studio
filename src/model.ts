@@ -399,6 +399,7 @@ export function createWolfBossBehaviorSettings(current: EnemyBehaviorSettings, a
   const ambushId = actionId("skill-shadow-ambush", "隐身背袭");
   const clawId = actionId("skill-claw-combo", "四连挥爪");
   const beamId = actionId("skill-lightning-beam", "雷电光束");
+  const summonId = actionId("skill-summon-lightning", "召唤落雷");
   const teleportId = actionId("skill-teleport", "瞬移");
   const nodes: EnemyBehaviorNode[] = [];
   const add = (id: string, name: string, type: EnemyBehaviorNodeType, parentId = "", order = 0) => {
@@ -460,6 +461,16 @@ export function createWolfBossBehaviorSettings(current: EnemyBehaviorSettings, a
   addAction("wolf-combo-5-ambush", "隐身背袭", ambushId, combo5.id, 3);
   addAction("wolf-combo-5-beam", "雷电光束", beamId, combo5.id, 4);
 
+  const combo6 = addCombo(6, "瞬移接雷电光束接召唤落雷", 10);
+  addAction("wolf-combo-6-teleport", "瞬移", teleportId, combo6.id, 3);
+  addAction("wolf-combo-6-beam", "雷电光束", beamId, combo6.id, 4);
+  addAction("wolf-combo-6-summon", "召唤落雷", summonId, combo6.id, 5);
+
+  const combo7 = addCombo(7, "瞬移接冲锋撞击接召唤落雷", 10);
+  addAction("wolf-combo-7-teleport", "瞬移", teleportId, combo7.id, 3);
+  addAction("wolf-combo-7-charge", "冲锋撞击", chargeId, combo7.id, 4);
+  addAction("wolf-combo-7-summon", "召唤落雷", summonId, combo7.id, 5);
+
   addTask("wolf-select-skill", "选择并释放技能", "useBestSkill", root.id, 1);
   addTask("wolf-chase", "追击玩家", "chase", root.id, 2);
   addTask("wolf-patrol", "场地巡逻", "patrol", root.id, 3);
@@ -520,6 +531,74 @@ export function ensureWolfBossCombo4TeleportSteps(current: EnemyBehaviorSettings
   updateStep("wolf-combo-4-turn-2", 8, baseX + 1150);
   updateStep("wolf-combo-4-charge-3", 9, baseX + 1380);
   return next;
+}
+
+export function ensureWolfBossExtraCombos(current: EnemyBehaviorSettings, actions: CharacterAction[]): EnemyBehaviorSettings {
+  const findAction = (id: string, name: string) => actions.find((action) => action.id === id)
+    || actions.find((action) => action.name.includes(name));
+  const teleport = findAction("skill-teleport", "瞬移");
+  const beam = findAction("skill-lightning-beam", "雷电光束");
+  const charge = findAction("skill-charge-knockback", "冲锋撞击");
+  const summon = findAction("skill-summon-lightning", "召唤落雷");
+  if (!teleport || !beam || !charge || !summon || !current.nodes.some((node) => node.id === "wolf-combo-random")) return current;
+
+  const next = structuredClone(current);
+  const byId = new Map(next.nodes.map((node) => [node.id, node]));
+  let changed = false;
+  const upsert = (
+    id: string,
+    name: string,
+    type: EnemyBehaviorNodeType,
+    parentId: string,
+    order: number,
+    patch: Partial<EnemyBehaviorNode> = {},
+  ) => {
+    let node = byId.get(id);
+    if (!node) {
+      node = createBehaviorNode(name, type, parentId, order);
+      node.id = id;
+      next.nodes.push(node);
+      byId.set(id, node);
+      changed = true;
+    }
+    const before = JSON.stringify(node);
+    Object.assign(node, { name, type, parentId, order }, patch);
+    if (JSON.stringify(node) !== before) changed = true;
+    return node;
+  };
+  const addCombo = (
+    index: number,
+    name: string,
+    steps: Array<{ id: string; name: string; actionId: string }>,
+  ) => {
+    const cooldownId = `wolf-combo-${index}-cooldown`;
+    const sequenceId = `wolf-combo-${index}`;
+    upsert(cooldownId, `${name}冷却`, "cooldown", "wolf-combo-random", index - 1, { durationSeconds: 10 });
+    upsert(sequenceId, name, "sequence", cooldownId, 0);
+    upsert(`wolf-combo-${index}-target`, "已发现目标", "condition", sequenceId, 0, { conditionKey: "hasTarget", comparison: "isTrue" });
+    upsert(`wolf-combo-${index}-stop`, "连招前停止", "customTask", sequenceId, 1, { taskKey: "stop" });
+    upsert(`wolf-combo-${index}-face`, "面向玩家", "customTask", sequenceId, 2, { taskKey: "faceTarget" });
+    steps.forEach((step, stepIndex) => {
+      upsert(step.id, step.name, "playAction", sequenceId, stepIndex + 3, {
+        actionId: step.actionId,
+        waitUntilComplete: true,
+        ignoreSkillCooldown: true,
+      });
+    });
+  };
+
+  addCombo(6, "瞬移接雷电光束接召唤落雷", [
+    { id: "wolf-combo-6-teleport", name: "瞬移", actionId: teleport.id },
+    { id: "wolf-combo-6-beam", name: "雷电光束", actionId: beam.id },
+    { id: "wolf-combo-6-summon", name: "召唤落雷", actionId: summon.id },
+  ]);
+  addCombo(7, "瞬移接冲锋撞击接召唤落雷", [
+    { id: "wolf-combo-7-teleport", name: "瞬移", actionId: teleport.id },
+    { id: "wolf-combo-7-charge", name: "冲锋撞击", actionId: charge.id },
+    { id: "wolf-combo-7-summon", name: "召唤落雷", actionId: summon.id },
+  ]);
+
+  return changed ? layoutEnemyBehaviorNodes(next) : current;
 }
 
 export function createFrame(assetId: string, name: string, durationTicks = 50): AnimationFrame {

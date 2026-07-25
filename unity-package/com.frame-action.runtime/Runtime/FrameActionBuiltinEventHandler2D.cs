@@ -884,7 +884,8 @@ namespace FrameAction
             if (source == null) source = instance.AddComponent<AudioSource>();
             source.clip = clip;
             source.loop = configuredLoop;
-            source.spatialBlend = 1f;
+            source.volume = 1f;
+            source.spatialBlend = 0f;
             source.Play();
             string destroyMode = configuredDestroyMode;
             if (!source.loop) FrameActionRuntimePool.ReleaseAfter(instance, Mathf.Max(0.05f, clip.length));

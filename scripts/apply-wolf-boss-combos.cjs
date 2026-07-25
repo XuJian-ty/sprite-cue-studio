@@ -58,6 +58,11 @@ function ensureSkill(id, name, enemySkill) {
 ensureSkill("skill-summon-lightning", "召唤落雷", { cooldownSeconds: 7, minRange: 2, maxRange: 9, selectionWeight: 75, lockMovement: true, lockFacing: true });
 ensureSkill("skill-lightning-beam", "雷电光束", { cooldownSeconds: 8, minRange: 3, maxRange: 10, selectionWeight: 85, lockMovement: true, lockFacing: true });
 
+const findActionId = (id, name) => project.actions.find((action) => action.id === id)?.id
+  || project.actions.find((action) => action.name.includes(name))?.id;
+const teleportId = findActionId("skill-teleport", "瞬移");
+if (!teleportId) throw new Error("缺少瞬移动作");
+
 const nodes = [];
 function add(id, name, type, parentId = "", order = 0) {
   const node = {
@@ -120,14 +125,26 @@ action("wolf-combo-3-claw", "四连挥爪", "skill-claw-combo", combo3.id, 5);
 
 const combo4 = combo(4, "三次往返冲锋", 8);
 action("wolf-combo-4-charge-1", "第一次冲锋", "skill-charge-knockback", combo4.id, 3);
-task("wolf-combo-4-turn-1", "第一次转向", "turnAround", combo4.id, 4);
-action("wolf-combo-4-charge-2", "第二次冲锋", "skill-charge-knockback", combo4.id, 5);
-task("wolf-combo-4-turn-2", "第二次转向", "turnAround", combo4.id, 6);
-action("wolf-combo-4-charge-3", "第三次冲锋", "skill-charge-knockback", combo4.id, 7);
+action("wolf-combo-4-teleport-1", "第一次转向前瞬移", teleportId, combo4.id, 4);
+task("wolf-combo-4-turn-1", "第一次转向", "turnAround", combo4.id, 5);
+action("wolf-combo-4-charge-2", "第二次冲锋", "skill-charge-knockback", combo4.id, 6);
+action("wolf-combo-4-teleport-2", "第二次转向前瞬移", teleportId, combo4.id, 7);
+task("wolf-combo-4-turn-2", "第二次转向", "turnAround", combo4.id, 8);
+action("wolf-combo-4-charge-3", "第三次冲锋", "skill-charge-knockback", combo4.id, 9);
 
 const combo5 = combo(5, "隐身背袭接雷电光束", 8);
 action("wolf-combo-5-ambush", "隐身背袭", "skill-shadow-ambush", combo5.id, 3);
 action("wolf-combo-5-beam", "雷电光束", "skill-lightning-beam", combo5.id, 4);
+
+const combo6 = combo(6, "瞬移接雷电光束接召唤落雷", 10);
+action("wolf-combo-6-teleport", "瞬移", teleportId, combo6.id, 3);
+action("wolf-combo-6-beam", "雷电光束", "skill-lightning-beam", combo6.id, 4);
+action("wolf-combo-6-summon", "召唤落雷", "skill-summon-lightning", combo6.id, 5);
+
+const combo7 = combo(7, "瞬移接冲锋撞击接召唤落雷", 10);
+action("wolf-combo-7-teleport", "瞬移", teleportId, combo7.id, 3);
+action("wolf-combo-7-charge", "冲锋撞击", "skill-charge-knockback", combo7.id, 4);
+action("wolf-combo-7-summon", "召唤落雷", "skill-summon-lightning", combo7.id, 5);
 
 task("wolf-select-skill", "选择并释放技能", "useBestSkill", root.id, 1);
 task("wolf-chase", "追击玩家", "chase", root.id, 2);
@@ -158,7 +175,7 @@ function place(id, depth) {
 }
 place(root.id, 0);
 
-const backupPath = `${projectPath}.before-lightning-skills-v3.bak`;
+const backupPath = `${projectPath}.before-lightning-skills-v4.bak`;
 if (!fs.existsSync(backupPath)) fs.copyFileSync(projectPath, backupPath);
 project.enemyBehavior = {
   ...project.enemyBehavior,

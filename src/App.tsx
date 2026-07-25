@@ -54,6 +54,7 @@ import {
   createEnemySkillSettings,
   createWolfBossBehaviorSettings,
   ensureWolfBossCombo4TeleportSteps,
+  ensureWolfBossExtraCombos,
   ensureWolfBossSkillActions,
   createFrame,
   createMotorSettings,
@@ -464,6 +465,7 @@ function cleanLegacyProjectData(value: CharacterProject): CharacterProject {
     }
     if (project.characterName === "狼妖Boss" && project.enemyBehavior) {
       project.enemyBehavior = ensureWolfBossCombo4TeleportSteps(project.enemyBehavior, project.actions);
+      project.enemyBehavior = ensureWolfBossExtraCombos(project.enemyBehavior, project.actions);
     }
   }
   for (const action of project.actions) {
@@ -2037,7 +2039,9 @@ export default function App() {
                   setPlaying(false);
                   return;
                 }
-                if (playheadTick >= duration - 1) setPlayheadTick(0);
+                const restartingAtBeginning = playheadTick >= duration - 1;
+                if (restartingAtBeginning) setPlayheadTick(0);
+                if (restartingAtBeginning || playheadTick <= 0) previousTick.current = -1;
                 setPlaying(true);
               }}>
                 {playing ? <CirclePause size={19} /> : <CirclePlay size={19} />}
