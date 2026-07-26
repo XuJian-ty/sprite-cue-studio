@@ -79,6 +79,7 @@ export default function ActionInspector({
       <section className="inspector-section">
         <div className="section-heading"><div><strong>{isEnemy ? "Unity 敌人装配" : "Unity 角色装配"}</strong><span>更新指定 Prefab</span></div></div>
         <label className="field" title={`Unity 项目 Assets 目录内的${isEnemy ? "敌人" : "角色"} Prefab 路径。存在时就地更新 Frame Action 管理内容；留空或路径不存在时创建新 Prefab`}><span>目标{isEnemy ? "敌人" : "角色"} Prefab</span><DeferredTextInput value={unityCharacter.prefabPath} placeholder={isEnemy ? "Assets/Enemies/Slime.prefab；留空时创建新敌人" : "Assets/Characters/Hero.prefab；留空时创建新角色"} onValueChange={(value) => updateUnityCharacter({ prefabPath: value })} /></label>
+        <label className="field" title="同步时创建或复用同名 Unity 物理层，并分配给角色身体碰撞体和受击区域。命中效果中的层级名必须与目标角色的物理层一致"><span>{isEnemy ? "敌人" : "角色"}物理层</span><DeferredTextInput value={unityCharacter.actorLayerName} placeholder={isEnemy ? "Enemy" : "Player"} onValueChange={(value) => updateUnityCharacter({ actorLayerName: value })} /></label>
         <div className="field-grid two-columns">
           <label className="field" title="角色与地面、墙体和其它实体发生物理接触的 Collider2D，不是攻击命中范围"><span>身体碰撞体</span><select value={unityCharacter.colliderShape} onChange={(event) => updateUnityCharacter({ colliderShape: event.target.value as CharacterProject["unityCharacter"]["colliderShape"] })}><option value="capsule">胶囊</option><option value="box">盒体</option></select></label>
           <NumberField label="刚体质量" title="写入 Rigidbody2D.mass，影响碰撞冲量和外力效果；标准走跑主要由速度驱动" value={unityCharacter.rigidbodyMass} min={0.01} step={0.1} onChange={(value) => updateUnityCharacter({ rigidbodyMass: value })} />
@@ -179,6 +180,8 @@ export default function ActionInspector({
         {!isEnemy && action.type === "move" && <NumberField label="双击窗口(秒)" value={action.doubleTapWindow} min={0.05} max={1} step={0.01} onChange={(value) => onUpdateAction({ doubleTapWindow: value })} />}
         {!isEnemy && action.type === "move" && <NumberField label={action.trigger.type === "axisDoubleTap" ? "跑步速度" : "移动速度"} title="当前移动动作对应的水平目标速度，单位为 Unity 单位/秒" value={action.movementSpeed} min={0} step={0.1} onChange={(value) => onUpdateAction({ movementSpeed: value })} />}
         <label className="toggle-row"><input type="checkbox" checked={action.loop} onChange={(event) => onUpdateAction({ loop: event.target.checked })} /><span>循环播放</span></label>
+        {!isEnemy && <label className="toggle-row" title="动作播放期间允许水平输入驱动角色移动并更新朝向；关闭后仍保留当前输入，动作结束时恢复移动。时间轴位移和受击位移不受影响"><input type="checkbox" checked={action.acceptMovementInput} onChange={(event) => onUpdateAction({ acceptMovementInput: event.target.checked })} /><span>接收移动输入</span></label>}
+        {!isEnemy && <label className="toggle-row" title="动作播放期间允许跳跃输入施加起跳速度，但保持当前动作动画和时间轴继续播放"><input type="checkbox" checked={action.acceptJumpInput} onChange={(event) => onUpdateAction({ acceptJumpInput: event.target.checked })} /><span>接收跳跃输入</span></label>}
       </section>
 
       {isEnemy && action.type === "skill" && <section className="inspector-section">
@@ -220,19 +223,18 @@ export default function ActionInspector({
       {!isEnemy && <section className="inspector-section">
         <div className="section-heading"><div><strong>转换关系</strong><span>打断 / 缓存 / 忽略</span></div></div>
         <div className="transition-editor-list">
-          {project.actions.filter((item) => item.id !== action.id && item.type !== "idleGround" && item.type !== "idleAir").map((target) => (
+          {project.actions.filter((item) => item.type !== "idleGround" && item.type !== "idleAir").map((target) => (
             <label className="transition-editor-row" key={target.id}>
-              <span>{target.name}</span>
+              <span>{target.name}{target.id === action.id ? "（自身）" : ""}</span>
               <select
-                value={action.transitions[target.id] || "none"}
+                value={action.transitions[target.id] || "interrupt"}
                 onChange={(event) => {
                   const next = { ...action.transitions };
-                  if (event.target.value === "none") delete next[target.id];
-                  else next[target.id] = event.target.value as "interrupt" | "buffer" | "ignore";
+                  next[target.id] = event.target.value as "interrupt" | "buffer" | "ignore";
                   onUpdateAction({ transitions: next });
                 }}
               >
-                <option value="none">无</option><option value="interrupt">打断</option><option value="buffer">缓存</option><option value="ignore">忽略</option>
+                <option value="interrupt">打断</option><option value="buffer">缓存</option><option value="ignore">忽略</option>
               </select>
             </label>
           ))}

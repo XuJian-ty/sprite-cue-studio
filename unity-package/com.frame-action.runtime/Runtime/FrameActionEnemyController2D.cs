@@ -14,6 +14,7 @@ namespace FrameAction
         public FrameActionPlayer player;
         public bool playGroundIdleOnEnable = true;
         public bool returnToIdleOnComplete;
+        public bool autoPlayDamageReaction = true;
         public bool airborne;
 
         public string CurrentActionId => player != null ? player.CurrentActionId : string.Empty;
@@ -56,7 +57,11 @@ namespace FrameAction
             if (renderOrder.targetRenderer == null) renderOrder.targetRenderer = player != null ? player.spriteRenderer : GetComponentInChildren<SpriteRenderer>(true);
             if (renderOrder.bodyCollider == null) renderOrder.bodyCollider = GetComponent<Collider2D>();
             FrameActionBuiltinEventHandler2D eventHandler = GetComponent<FrameActionBuiltinEventHandler2D>();
-            if (eventHandler != null) eventHandler.vfxSortingOrder = 11;
+            if (eventHandler != null)
+            {
+                eventHandler.vfxSortingOrder = 1000;
+                eventHandler.vfxBackSortingOrder = -1500;
+            }
         }
 
         private void OnEnable()
@@ -212,7 +217,7 @@ namespace FrameAction
         {
             if (IsInvincible) return;
             DamageReceived?.Invoke(context);
-            if (!HasSuperArmor) PlayFirstActionOfType("hurt");
+            if (autoPlayDamageReaction && !HasSuperArmor) PlayFirstActionOfType("hurt");
             RefreshActionLock();
         }
 

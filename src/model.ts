@@ -67,9 +67,10 @@ export function createCameraFollowSettings(): CameraFollowSettings {
   };
 }
 
-export function createUnityCharacterSettings(): UnityCharacterSettings {
+export function createUnityCharacterSettings(actorLayerName = "Player"): UnityCharacterSettings {
   return {
     prefabPath: "",
+    actorLayerName,
     collideWithOtherActors: false,
     colliderShape: "capsule",
     colliderWidth: 0.6,
@@ -149,6 +150,8 @@ export function createAction(name = "新动作", type: CharacterAction["type"] =
     name,
     type,
     loop: false,
+    acceptMovementInput: type !== "attack",
+    acceptJumpInput: false,
     comboCount,
     comboWindow: 0.12,
     repeatWindow: 0.28,
@@ -214,7 +217,7 @@ export function createProject(): CharacterProject {
   hurt.transitions = { "drop-through": "ignore" };
   return {
     format: "frame-action-project",
-    version: 6,
+    version: 11,
     projectKind: "character",
     tickRate: 600,
     characterName: "新角色",
@@ -257,7 +260,7 @@ export function createEnemyProject(): CharacterProject {
   cameraFollow.enabled = false;
   return {
     format: "frame-action-project",
-    version: 6,
+    version: 11,
     projectKind: "enemy",
     tickRate: 600,
     characterName: "新敌人",
@@ -267,7 +270,7 @@ export function createEnemyProject(): CharacterProject {
     airIdleId: airIdle.id,
     motor,
     cameraFollow,
-    unityCharacter: createUnityCharacterSettings(),
+    unityCharacter: createUnityCharacterSettings("Enemy"),
     enemyBehavior: createEnemyBehaviorSettings(),
     actions,
   };
@@ -392,6 +395,7 @@ export function createTimelineEvent(kind: TrackKind, startTick: number, pixelsPe
     base.params = {
       repeatedAnchorMode: "follow",
       damageEffects: [{
+        triggerDelayTicks: 0,
         detectionDurationTicks: 0,
         activationTick: 0,
         activationMode: "continuous",
@@ -446,7 +450,7 @@ export function createTimelineEvent(kind: TrackKind, startTick: number, pixelsPe
   } else if (kind === "vfx") {
     base.name = "特效事件";
     base.type = "vfx";
-    base.params = { vfxEffects: [{ assetId: "", frameAssetIds: [], fps: 12, pixelsPerUnit: Math.max(1, pixelsPerUnit), pivotX: 0.5, pivotY: 0.5, loop: false, anchor: "caster", useFollowDuration: false, followDurationTicks: 0, x: 0, y: 0, rotation: 0, scale: 1, motion: { enabled: false, mode: "linear", speed: 0, directionX: 1, directionY: 0, durationTicks: 180, controlAX: 0.4, controlAY: 0.2, controlBX: 0.8, controlBY: 0.2, endX: 1.2, endY: 0, retargetOnDescendingPath: false, pathProgressCurve: [{ time: 0, value: 0, tangentMode: "linear" }, { time: 1, value: 1, tangentMode: "linear" }] }, destroyMode: "natural", durationTicks: 0 }] };
+    base.params = { vfxEffects: [{ assetId: "", frameAssetIds: [], fps: 12, pixelsPerUnit: Math.max(1, pixelsPerUnit), pivotX: 0.5, pivotY: 0.5, renderLayer: "front", loop: false, anchor: "caster", useFollowDuration: false, followDurationTicks: 0, x: 0, y: 0, rotation: 0, scale: 1, triggerDelayTicks: 0, motion: { enabled: false, mode: "linear", speed: 0, directionX: 1, directionY: 0, durationTicks: 180, controlAX: 0.4, controlAY: 0.2, controlBX: 0.8, controlBY: 0.2, endX: 1.2, endY: 0, retargetOnDescendingPath: false, pathProgressCurve: [{ time: 0, value: 0, tangentMode: "linear" }, { time: 1, value: 1, tangentMode: "linear" }] }, destroyMode: "natural", durationTicks: 0 }] };
   } else if (kind === "sfx") {
     base.name = "音效事件";
     base.type = "sfx";

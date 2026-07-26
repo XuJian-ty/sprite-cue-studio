@@ -59,12 +59,13 @@ const PHYSICS_LABELS: Record<string, string> = {
   teleportSelf: "瞬移",
   stun: "眩晕",
   airborne: "腾空",
+  hover: "滞空",
   superArmor: "霸体",
   invincible: "无敌",
 };
 
-const TOP_LEVEL_PHYSICS = ["dashSelf", "teleportSelf", "airborne", "superArmor", "invincible"];
-const ON_HIT_PHYSICS = ["knockback", "pull", "launch", "stun"];
+const TOP_LEVEL_PHYSICS = ["dashSelf", "teleportSelf", "airborne", "hover", "superArmor", "invincible"];
+const ON_HIT_PHYSICS = ["knockback", "pull", "launch", "hover", "stun"];
 
 const defaultPhysics = (scope: "topLevel" | "onHit") => ({
   effectType: scope === "topLevel" ? "dashSelf" : "knockback",
@@ -99,6 +100,7 @@ const defaultVfx = (pixelsPerUnit = 160) => ({
   pixelsPerUnit: Math.max(1, pixelsPerUnit),
   pivotX: 0.5,
   pivotY: 0.5,
+  renderLayer: "front",
   loop: false,
   anchor: "caster",
   useFollowDuration: false,
@@ -280,9 +282,10 @@ function PhysicsEffects({ values, onChange, scope, title = "物理效果" }: {
             value={effectType}
             onChange={(value) => {
               const height = ["launch", "airborne"].includes(value) ? Math.max(0.1, numeric(effect.height) || 1) : 0;
+              const durationTicks = value === "hover" ? Math.max(1, numeric(effect.durationTicks) || 60) : numeric(effect.durationTicks);
               patch(index, value === "teleportSelf"
                 ? { effectType: value, height, anchor: effect.anchor === "target" ? "target" : "self", durationMode: "fixed", durationTicks: 0 }
-                : ["superArmor", "invincible"].includes(value) ? { effectType: value, height } : { effectType: value, height, durationMode: "fixed" });
+                : ["superArmor", "invincible"].includes(value) ? { effectType: value, height } : { effectType: value, height, durationTicks, durationMode: "fixed" });
             }}
             options={allowedTypes.map((value) => [value, PHYSICS_LABELS[value]])}
           />
@@ -297,7 +300,7 @@ function PhysicsEffects({ values, onChange, scope, title = "物理效果" }: {
             {scope === "onHit" && <NumberField label="生效延迟 Tick" value={numeric(effect.delayTicks)} min={0} integer onChange={(value) => patch(index, { delayTicks: value })} />}
             {usesDistance && <NumberField label="距离" value={numeric(effect.distance)} min={isTeleport ? undefined : 0} step={0.1} onChange={(value) => patch(index, { distance: value })} title={isTeleport ? "0 为锚点位置；正数为锚点前方，负数为锚点后方" : undefined} />}
             {usesHeight && <NumberField label="高度" value={numeric(effect.height)} min={0} step={0.1} onChange={(value) => patch(index, { height: value })} />}
-            {!isTeleport && durationMode === "fixed" && <NumberField label="持续 Tick" value={numeric(effect.durationTicks)} min={0} integer onChange={(value) => patch(index, { durationTicks: value })} />}
+            {!isTeleport && durationMode === "fixed" && <NumberField label="持续 Tick" value={numeric(effect.durationTicks)} min={effectType === "hover" ? 1 : 0} integer onChange={(value) => patch(index, { durationTicks: Math.max(effectType === "hover" ? 1 : 0, value) })} />}
           </div>
           {isTeleport && <div className="time-readout">落点会自动进行地面贴合、墙体阻挡、碰撞修正和速度清理。</div>}
           {supportsUntilActionEnd && <SelectField label="持续方式" value={durationMode} onChange={(value) => patch(index, { durationMode: value })} options={[["fixed", "指定时长"], ["untilActionEnd", "动作结束"]]} />}
@@ -474,6 +477,7 @@ function VfxEffects({ values, onChange, assets, onCreateAssets, timing, defaultP
     <EffectHeader title={title} onAdd={() => onChange([...values, defaultVfx(defaultPixelsPerUnit)])} />
     {values.map((effect, index) => {
       const anchor = effect.anchor || "caster";
+      const renderLayer = effect.renderLayer === "back" ? "back" : "front";
       const useFollowDuration = anchor !== "world" && Boolean(effect.useFollowDuration);
       const loop = timing === "event" && Boolean(effect.loop);
       const destroyMode = effect.destroyMode === "onActionEnd" ? "onActionEnd" : "timed";
@@ -487,8 +491,9 @@ function VfxEffects({ values, onChange, assets, onCreateAssets, timing, defaultP
               anchor: value,
               ...(value === "world" ? { useFollowDuration: false, followDurationTicks: 0 } : { motion: defaultMotion() }),
             })} options={anchorOptions} />
-            {timing === "onHit" && <NumberField label="生效延迟 Tick" value={numeric(effect.triggerDelayTicks)} min={0} integer onChange={(value) => patch(index, { triggerDelayTicks: value })} />}
+            <SelectField label="渲染层级" title="相对所属玩家或敌人的渲染层级，使用独立排序分区" value={renderLayer} onChange={(value) => patch(index, { renderLayer: value })} options={[["front", "人物前"], ["back", "人物后"]]} />
           </div>
+          <NumberField label="生效延迟 Tick" value={numeric(effect.triggerDelayTicks)} min={0} integer onChange={(value) => patch(index, { triggerDelayTicks: value })} />
           <div className="field-grid two-columns">
             <NumberField label="位置 X" value={numeric(effect.x)} step={0.1} onChange={(value) => patch(index, { x: value })} />
             <NumberField label="位置 Y" value={numeric(effect.y)} step={0.1} onChange={(value) => patch(index, { y: value })} />
@@ -547,6 +552,7 @@ function CompanionVfxEffects({ values, onChange, assets, onCreateAssets, default
       <summary><span>{index + 1}. {vfxResourceLabel(effect, assets)}</span><RemoveButton onClick={() => onChange(values.filter((_, cursor) => cursor !== index))} /></summary>
       <div className="effect-block-body">
         <VfxResourceEditor effect={effect} assets={assets} onChange={(next) => patch(index, next)} onCreateAssets={onCreateAssets} defaultPixelsPerUnit={defaultPixelsPerUnit} />
+        <SelectField label="渲染层级" title="相对所属玩家或敌人的渲染层级，使用独立排序分区" value={effect.renderLayer === "back" ? "back" : "front"} onChange={(value) => patch(index, { renderLayer: value })} options={[["front", "人物前"], ["back", "人物后"]]} />
         <div className="field-grid two-columns">
           <NumberField label="位置 X" value={numeric(effect.x)} step={0.1} onChange={(value) => patch(index, { x: value })} />
           <NumberField label="位置 Y" value={numeric(effect.y)} step={0.1} onChange={(value) => patch(index, { y: value })} />
@@ -584,7 +590,7 @@ function SfxEffects({ values, onChange, assets, onCreateAssets, timing, title = 
           <label className="asset-bind-button"><input type="file" accept="audio/*" onChange={async (event) => { const input = event.currentTarget; const file = input.files?.[0]; if (file) { const ids = await onCreateAssets([file], "audio"); patch(index, { assetId: ids[0] || "" }); } input.value = ""; }} /><Upload size={14} />{assets[effect.assetId]?.name || "绑定音效资源"}</label>
           <div className="field-grid two-columns">
             <SelectField label="挂点" title={timing === "onHit" ? "施法者=随攻击者；目标=随本次命中的对象；世界=固定在命中时的世界坐标" : "施法者=随当前角色；世界=固定在触发时的世界坐标"} value={effect.anchor || "caster"} onChange={(value) => patch(index, { anchor: value })} options={anchorOptions} />
-            {timing === "onHit" && <NumberField label="生效延迟 Tick" value={numeric(effect.triggerDelayTicks)} min={0} integer onChange={(value) => patch(index, { triggerDelayTicks: value })} />}
+            <NumberField label="生效延迟 Tick" value={numeric(effect.triggerDelayTicks)} min={0} integer onChange={(value) => patch(index, { triggerDelayTicks: value })} />
           </div>
           <div className="field-grid two-columns">
             <NumberField label="位置 X" value={numeric(effect.x)} step={0.1} onChange={(value) => patch(index, { x: value })} />
@@ -609,6 +615,7 @@ function DamageEffects({ values, onChange, assets, onCreateAssets, defaultPixels
   tickRate: number;
 }) {
   const add = () => onChange([...values, {
+    triggerDelayTicks: 0,
     detectionDurationTicks: 0,
     activationTick: 0,
     activationMode: "continuous",
@@ -687,7 +694,8 @@ function DamageEffects({ values, onChange, assets, onCreateAssets, defaultPixels
               ? { detectionType: value, shape: shape === "circle" ? "circle" : "box", anchor: effect.anchor || "world", motion: (effect.anchor || "world") !== "world" ? defaultMotion() : effect.motion || defaultMotion(), detectionDurationTicks: numeric(effect.detectionDurationTicks) > 0 ? numeric(effect.detectionDurationTicks) : 600, boxGrowthEnabled: false }
               : { detectionType: value, ...(value === "rangeOverlap" ? {} : { boxGrowthEnabled: false }) })} options={[["rangeOverlap", "范围检测"], ["raycast", "射线检测"], ["physicalEntity", "物理实体"]]} />
             <label className="field"><span>命中层级名</span><DeferredTextInput value={effect.hitLayerName || ""} onValueChange={(value) => patch({ hitLayerName: value })} /></label>
-            <NumberField label={detectionType === "physicalEntity" ? "持续时长 Tick" : "检测时长 Tick"} title={detectionType === "physicalEntity" ? "物理实体和伴随特效从生成到回收的持续时间" : "从命中事件触发时刻起算的完整检测窗口。为 0 时在事件触发时立即检测一次"} value={numeric(effect.detectionDurationTicks)} min={detectionType === "physicalEntity" ? 1 : 0} integer onChange={(value) => {
+            <NumberField label="生效延迟 Tick" title="事件触发时记录挂点位置、旋转、朝向和检测配置；延迟结束后以这份快照开始生成或检测" value={numeric(effect.triggerDelayTicks)} min={0} integer onChange={(value) => patch({ triggerDelayTicks: Math.max(0, Math.round(value)) })} />
+            <NumberField label={detectionType === "physicalEntity" ? "持续时长 Tick" : "检测时长 Tick"} title={detectionType === "physicalEntity" ? "物理实体和伴随特效从生效生成到回收的持续时间" : "从命中检测生效时刻起算的完整检测窗口。为 0 时在生效时立即检测一次"} value={numeric(effect.detectionDurationTicks)} min={detectionType === "physicalEntity" ? 1 : 0} integer onChange={(value) => {
               const detectionDurationTicks = Math.max(detectionType === "physicalEntity" ? 1 : 0, value);
               patch({ detectionDurationTicks, activationTick: Math.min(Math.max(0, numeric(effect.activationTick)), detectionDurationTicks) });
             }} />
@@ -714,7 +722,7 @@ function DamageEffects({ values, onChange, assets, onCreateAssets, defaultPixels
               {shape === "box" && <NumberField label="盒体高度" value={numeric(effect.boxHeight)} min={0.01} step={0.1} onChange={(value) => patch({ boxHeight: value })} />}
             </div>
             {detectionType === "rangeOverlap" && shape === "box" && <>
-              <label className="toggle-row" title="保持盒体反方向一侧不动，从命中事件触发时刻开始沿指定方向伸长"><input type="checkbox" checked={boxGrowthEnabled} onChange={(event) => patch({ boxGrowthEnabled: event.target.checked })} /><span>随时间伸长</span></label>
+              <label className="toggle-row" title="保持盒体反方向一侧不动，从命中检测生效时刻开始沿指定方向伸长"><input type="checkbox" checked={boxGrowthEnabled} onChange={(event) => patch({ boxGrowthEnabled: event.target.checked })} /><span>随时间伸长</span></label>
               {boxGrowthEnabled && <>
                 <div className="field-grid two-columns">
                   <SelectField label="伸长方向" title="左右方向使用动作局部坐标并随角色转向镜像；四个方向都会跟随盒体旋转" value={boxGrowthDirection} onChange={(value) => patch({ boxGrowthDirection: value })} options={[["right", "右"], ["left", "左"], ["up", "上"], ["down", "下"]]} />
@@ -762,8 +770,8 @@ function DamageEffects({ values, onChange, assets, onCreateAssets, defaultPixels
             <EffectHeader title="命中伤害效果" onAdd={() => patch({ onHitDamageEffects: [...(effect.onHitDamageEffects || []), { delayTicks: 0, damageMultiplier: 1, fixedDamage: 0 }] })} />
             {(effect.onHitDamageEffects || []).map((item: any, hitIndex: number) => <div className="inline-effect-row" key={hitIndex}>
               <NumberField label="延迟 Tick" value={numeric(item.delayTicks)} min={0} integer onChange={(value) => { const list = structuredClone(effect.onHitDamageEffects); list[hitIndex].delayTicks = value; patch({ onHitDamageEffects: list }); }} />
-              <NumberField label="伤害倍率" value={numeric(item.damageMultiplier)} min={0} step={0.1} onChange={(value) => { const list = structuredClone(effect.onHitDamageEffects); list[hitIndex].damageMultiplier = value; patch({ onHitDamageEffects: list }); }} />
-              <NumberField label="固定伤害值" title="技能或元素伤害公式使用的基础固定值；普通攻击可保持为 0，只使用伤害倍率" value={numeric(item.fixedDamage)} min={0} step={1} onChange={(value) => { const list = structuredClone(effect.onHitDamageEffects); list[hitIndex].fixedDamage = value; patch({ onHitDamageEffects: list }); }} />
+              <NumberField label="伤害倍率" title="原样传递给 Unity 的倍率字段，可输入负值；具体计算由命中接收方实现" value={numeric(item.damageMultiplier)} step={0.1} onChange={(value) => { const list = structuredClone(effect.onHitDamageEffects); list[hitIndex].damageMultiplier = value; patch({ onHitDamageEffects: list }); }} />
+              <NumberField label="固定伤害值" title="原样传递给 Unity 的固定值字段，可输入负值；具体计算由命中接收方实现" value={numeric(item.fixedDamage)} step={1} onChange={(value) => { const list = structuredClone(effect.onHitDamageEffects); list[hitIndex].fixedDamage = value; patch({ onHitDamageEffects: list }); }} />
               <RemoveButton onClick={() => patch({ onHitDamageEffects: effect.onHitDamageEffects.filter((_: any, cursor: number) => cursor !== hitIndex) })} />
             </div>)}
           </div>

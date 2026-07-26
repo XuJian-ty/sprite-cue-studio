@@ -10,8 +10,8 @@ namespace FrameAction
         public SpriteRenderer targetRenderer;
         public Collider2D bodyCollider;
         [Min(0.1f)] public float depthBucketsPerWorldUnit = 4f;
-        public int minimumSortingOrder = -900;
-        public int maximumSortingOrder = 9;
+        public int minimumSortingOrder = -1000;
+        public int maximumSortingOrder = 0;
 
         private static readonly List<FrameActionEnemyRenderOrder2D> ActiveEnemies = new List<FrameActionEnemyRenderOrder2D>();
         private int _instanceId;

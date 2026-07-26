@@ -2,17 +2,20 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const os = require("os");
 const sharp = require("sharp");
 
 const ROOT = __dirname;
 const DIST = path.join(ROOT, "dist");
-const PROJECT_SCHEMA_VERSION = 6;
+const PROJECT_SCHEMA_VERSION = 11;
 const RUNTIME_PACKAGE_NAME = "com.frame-action.runtime";
 const PORT = Number(process.env.PORT || 5188);
 const JSON_BODY_LIMIT = 150 * 1024 * 1024;
 const MAP_ASSET_CHUNK_LIMIT = 8 * 1024 * 1024;
+const ACTOR_ASSET_CHUNK_LIMIT = 8 * 1024 * 1024;
 const MAP_BACKGROUND_TILE_SIZE = 4096;
 const mapAssetUploads = new Map();
+const actorSyncUploads = new Map();
 
 function sendJson(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -199,6 +202,26 @@ function writeIfChanged(filePath, data) {
   return true;
 }
 
+function sha256Buffer(buffer) {
+  return crypto.createHash("sha256").update(buffer).digest("hex");
+}
+
+function sha256File(filePath) {
+  return sha256Buffer(fs.readFileSync(filePath));
+}
+
+function isSha256(value) {
+  return /^[a-f0-9]{64}$/i.test(String(value || ""));
+}
+
+function resolveContainedFile(root, relativePath) {
+  if (!relativePath) return null;
+  const fullPath = path.resolve(root, String(relativePath));
+  const relative = path.relative(root, fullPath);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return null;
+  return fullPath;
+}
+
 function decodeDataUrl(value) {
   const match = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(String(value || ""));
   if (!match) throw new Error("资源数据不是有效的 Data URL");
@@ -304,6 +327,169 @@ function finishMapAssetUpload(uploadId) {
   fs.renameSync(session.tempPath, session.targetPath);
   mapAssetUploads.delete(uploadId);
   return { assetId: session.assetId, relativePath: session.relativePath, byteSize: session.expectedBytes };
+}
+
+function removeActorSyncUpload(uploadId) {
+  const session = actorSyncUploads.get(uploadId);
+  if (!session) return;
+  actorSyncUploads.delete(uploadId);
+  if (fs.existsSync(session.tempRoot)) fs.rmSync(session.tempRoot, { recursive: true, force: true });
+}
+
+function resolveActorSyncLocation(root, project, actorKind, targetJsonPath) {
+  const targetActor = findUnityActorByJsonPath(root, targetJsonPath, actorKind);
+  const sameNameActor = findUnityActorOverwrite(root, project.characterName, actorKind);
+  const overwriteActor = !targetActor ? sameNameActor : null;
+  const existingActor = targetActor || overwriteActor;
+  let slug = characterSlug(project.characterName);
+  if (existingActor) slug = path.basename(path.dirname(existingActor.jsonPath));
+  const dataRoot = path.join(root, "Assets", "FrameActionData", actorKind === "enemy" ? "Enemies" : "Characters", slug);
+  return {
+    targetActor,
+    sameNameActor,
+    overwriteActor,
+    existingActor,
+    slug,
+    dataRoot,
+    jsonPath: path.join(dataRoot, `${slug}.frame-action.json`),
+  };
+}
+
+function startActorSyncUpload(root, payload) {
+  const actorKind = payload.actorKind === "enemy" ? "enemy" : "character";
+  const project = migrateCharacterProject(payload.project);
+  if (!project || project.format !== "frame-action-project" || project.projectKind !== actorKind) {
+    throw new Error(`${actorKind === "enemy" ? "敌人" : "角色"}动作数据格式无效`);
+  }
+  project.characterName = String(project.characterName || "").trim();
+  if (!project.characterName) throw new Error(`${actorKind === "enemy" ? "敌人" : "角色"}名称不能为空`);
+  const runtime = requireCompatibleRuntime(root);
+  const location = resolveActorSyncLocation(root, project, actorKind, payload.targetJsonPath);
+  let previousAssets = [];
+  if (fs.existsSync(location.jsonPath)) {
+    try {
+      previousAssets = JSON.parse(fs.readFileSync(location.jsonPath, "utf8")).assets || [];
+    } catch {
+      previousAssets = [];
+    }
+  }
+  const previousById = new Map(previousAssets.filter((asset) => asset?.id).map((asset) => [String(asset.id), asset]));
+  const sourceAssets = Array.isArray(payload.assets) ? payload.assets : [];
+  for (const [existingUploadId, session] of actorSyncUploads) {
+    if (session.root === root && session.actorKind === actorKind) removeActorSyncUpload(existingUploadId);
+  }
+  const uploadId = crypto.randomUUID();
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "spritecue-actor-sync-"));
+  const uploadAssets = new Map();
+  const seenAssetIds = new Set();
+  const sanitizedAssets = [];
+  try {
+    for (let index = 0; index < sourceAssets.length; index += 1) {
+      const asset = sourceAssets[index];
+      const assetId = String(asset?.id || "");
+      const expectedBytes = Number(asset?.byteSize);
+      const expectedSha256 = String(asset?.sha256 || "").toLowerCase();
+      if (!assetId || seenAssetIds.has(assetId)) throw new Error("同步资源 ID 无效或重复");
+      if (!Number.isSafeInteger(expectedBytes) || expectedBytes <= 0) throw new Error(`资源大小无效：${asset?.name || assetId}`);
+      if (!isSha256(expectedSha256)) throw new Error(`资源哈希无效：${asset?.name || assetId}`);
+      seenAssetIds.add(assetId);
+
+      let reusedPath = "";
+      const previous = previousById.get(assetId);
+      const previousPath = resolveContainedFile(location.dataRoot, previous?.path);
+      if (previousPath && fs.existsSync(previousPath) && fs.statSync(previousPath).isFile() && fs.statSync(previousPath).size === expectedBytes) {
+        const previousSha256 = isSha256(previous?.sha256) && Number(previous?.byteSize) === expectedBytes
+          ? String(previous.sha256).toLowerCase()
+          : sha256File(previousPath);
+        if (previousSha256 === expectedSha256) reusedPath = String(previous.path).replace(/\\/g, "/");
+      }
+
+      if (!reusedPath) {
+        const tempPath = path.join(tempRoot, `${String(index).padStart(6, "0")}.part`);
+        fs.writeFileSync(tempPath, Buffer.alloc(0));
+        uploadAssets.set(assetId, {
+          expectedBytes,
+          expectedSha256,
+          receivedBytes: 0,
+          tempPath,
+          name: String(asset.name || assetId),
+        });
+      }
+      sanitizedAssets.push({
+        id: assetId,
+        name: asset.name,
+        kind: asset.kind,
+        usage: asset.usage,
+        byteSize: expectedBytes,
+        sha256: expectedSha256,
+        reusedPath,
+      });
+    }
+    actorSyncUploads.set(uploadId, {
+      root,
+      actorKind,
+      runtime,
+      tempRoot,
+      assets: uploadAssets,
+      payload: {
+        project,
+        assets: sanitizedAssets,
+        confirmOverwrite: payload.confirmOverwrite === true,
+        targetJsonPath: String(payload.targetJsonPath || ""),
+      },
+    });
+  } catch (error) {
+    if (fs.existsSync(tempRoot)) fs.rmSync(tempRoot, { recursive: true, force: true });
+    throw error;
+  }
+  return {
+    uploadId,
+    assetCount: sanitizedAssets.length,
+    uploadAssetIds: Array.from(uploadAssets.keys()),
+    uploadAssetCount: uploadAssets.size,
+    reusedAssetCount: sanitizedAssets.length - uploadAssets.size,
+  };
+}
+
+function appendActorSyncUpload(uploadId, assetId, offset, chunk) {
+  const session = actorSyncUploads.get(uploadId);
+  if (!session) throw new Error("角色资源上传会话不存在，请重新同步");
+  const asset = session.assets.get(assetId);
+  if (!asset) throw new Error("角色资源不属于当前上传会话");
+  if (!Number.isSafeInteger(offset) || offset !== asset.receivedBytes) {
+    const error = new Error(`角色资源分块顺序错误，服务端已接收 ${asset.receivedBytes} 字节`);
+    error.statusCode = 409;
+    throw error;
+  }
+  if (!chunk.length || asset.receivedBytes + chunk.length > asset.expectedBytes) throw new Error("角色资源分块大小无效");
+  fs.appendFileSync(asset.tempPath, chunk);
+  asset.receivedBytes += chunk.length;
+  return { uploadId, assetId, receivedBytes: asset.receivedBytes, expectedBytes: asset.expectedBytes };
+}
+
+function finishActorSyncUpload(uploadId) {
+  const session = actorSyncUploads.get(uploadId);
+  if (!session) throw new Error("角色资源上传会话不存在，请重新同步");
+  try {
+    for (const asset of session.assets.values()) {
+      if (asset.receivedBytes !== asset.expectedBytes) {
+        throw new Error(`资源“${asset.name}”尚未上传完整：${asset.receivedBytes}/${asset.expectedBytes} 字节`);
+      }
+      if (sha256File(asset.tempPath) !== asset.expectedSha256) throw new Error(`资源“${asset.name}”上传内容校验失败，请重新同步`);
+    }
+    const uploadedAssetPaths = new Map(Array.from(session.assets, ([assetId, asset]) => [assetId, asset.tempPath]));
+    const result = syncCharacter(session.root, session.payload, session.actorKind, uploadedAssetPaths);
+    return {
+      runtime: session.runtime,
+      result: {
+        ...result,
+        uploadedAssetCount: session.assets.size,
+        reusedAssetCount: session.payload.assets.length - session.assets.size,
+      },
+    };
+  } finally {
+    removeActorSyncUpload(uploadId);
+  }
 }
 
 function fileMimeType(filePath, kind) {
@@ -591,6 +777,8 @@ function migrateCharacterProject(value) {
       allowLastRepeat: false,
       doubleTapWindow: 0.28,
       movementSpeed: 4,
+      acceptMovementInput: true,
+      acceptJumpInput: false,
       trigger: { type: "keyboardChord", code: "S", secondaryCode: "K" },
       transitions: Object.fromEntries(actions.map((action) => [action.id, action.type === "hurt" ? "interrupt" : "ignore"])),
       segments: [{
@@ -619,6 +807,32 @@ function migrateCharacterProject(value) {
     const jumpIndex = jump ? actions.indexOf(jump) : actions.length - 1;
     actions.splice(jumpIndex + 1, 0, dropThrough);
   }
+  for (const action of actions) {
+    if (!action) continue;
+    action.acceptMovementInput = typeof action.acceptMovementInput === "boolean"
+      ? action.acceptMovementInput
+      : action.type !== "attack";
+    action.acceptJumpInput = typeof action.acceptJumpInput === "boolean"
+      ? action.acceptJumpInput
+      : false;
+    for (const segment of Array.isArray(action.segments) ? action.segments : []) {
+      for (const track of Array.isArray(segment?.tracks) ? segment.tracks : []) {
+        for (const event of Array.isArray(track?.events) ? track.events : []) {
+          const params = event?.params && typeof event.params === "object" ? event.params : {};
+          const vfxEffects = track.kind === "vfx" && Array.isArray(params.vfxEffects) ? params.vfxEffects : [];
+          const damageEffects = track.kind === "damage" && Array.isArray(params.damageEffects) ? params.damageEffects : [];
+          for (const effect of vfxEffects) if (effect && typeof effect === "object") effect.renderLayer = effect.renderLayer === "back" ? "back" : "front";
+          for (const damageEffect of damageEffects) {
+            const nestedEffects = [
+              ...(Array.isArray(damageEffect?.companionVfxEffects) ? damageEffect.companionVfxEffects : []),
+              ...(Array.isArray(damageEffect?.onHitVfxEffects) ? damageEffect.onHitVfxEffects : []),
+            ];
+            for (const effect of nestedEffects) if (effect && typeof effect === "object") effect.renderLayer = effect.renderLayer === "back" ? "back" : "front";
+          }
+        }
+      }
+    }
+  }
   project.cameraFollow = {
     enabled: true,
     followHorizontal: true,
@@ -634,6 +848,7 @@ function migrateCharacterProject(value) {
   };
   project.unityCharacter = {
     ...(project.unityCharacter && typeof project.unityCharacter === "object" ? project.unityCharacter : {}),
+    actorLayerName: String(project.unityCharacter?.actorLayerName || (project.projectKind === "enemy" ? "Enemy" : "Player")).trim() || (project.projectKind === "enemy" ? "Enemy" : "Player"),
     collideWithOtherActors: project.unityCharacter?.collideWithOtherActors === true,
   };
   if (project.projectKind === "enemy") {
@@ -750,11 +965,11 @@ function migrateCharacterProject(value) {
   } else {
     for (const action of actions) if (action) delete action.enemySkill;
   }
-  project.version = 6;
+  project.version = 11;
   return project;
 }
 
-function syncCharacter(root, payload, expectedKind = "character") {
+function syncCharacter(root, payload, expectedKind = "character", uploadedAssetPaths = null) {
   const project = migrateCharacterProject(payload.project);
   if (!project || project.format !== "frame-action-project" || project.projectKind !== expectedKind) throw new Error(`${expectedKind === "enemy" ? "敌人" : "角色"}动作数据格式无效`);
   const isEnemy = expectedKind === "enemy";
@@ -762,25 +977,19 @@ function syncCharacter(root, payload, expectedKind = "character") {
   const actorLabel = isEnemy ? "敌人" : "角色";
   project.characterName = String(project.characterName || "").trim();
   if (!project.characterName) throw new Error(`${actorLabel}名称不能为空`);
-  const targetActor = findUnityActorByJsonPath(root, payload.targetJsonPath, actorKind);
-  const sameNameActor = findUnityActorOverwrite(root, project.characterName, actorKind);
+  const location = resolveActorSyncLocation(root, project, actorKind, payload.targetJsonPath);
+  const { targetActor, sameNameActor, overwriteActor, existingActor, slug, dataRoot, jsonPath } = location;
   if (targetActor && sameNameActor && sameNameActor.jsonPath !== targetActor.jsonPath) {
     const error = new Error(`另一个已同步${actorLabel}正在使用名称“${project.characterName}”。请换一个名称后再更新当前${actorLabel}。`);
     error.statusCode = 409;
     throw error;
   }
-  const overwriteActor = !targetActor ? sameNameActor : null;
-  const existingActor = targetActor || overwriteActor;
-  let slug = characterSlug(project.characterName);
-  if (existingActor) slug = path.basename(path.dirname(existingActor.jsonPath));
   const configuredPrefabPath = targetActor
     ? project.unityCharacter?.prefabPath || targetActor.prefabPath
     : project.unityCharacter?.prefabPath || overwriteActor?.prefabPath || "";
   let prefabPath = isEnemy
     ? validateEnemyPrefabPath(configuredPrefabPath, slug, project.characterName)
     : validateCharacterPrefabPath(configuredPrefabPath, slug, project.characterName);
-  const dataRoot = path.join(root, "Assets", "FrameActionData", isEnemy ? "Enemies" : "Characters", slug);
-  const jsonPath = path.join(dataRoot, `${slug}.frame-action.json`);
   if (overwriteActor && payload.confirmOverwrite !== true) {
     const error = new Error(`Unity 项目中已存在同名${actorLabel}“${project.characterName}”。确认覆盖后才会更新其动作数据和 Prefab。`);
     error.statusCode = 409;
@@ -803,9 +1012,11 @@ function syncCharacter(root, payload, expectedKind = "character") {
   }
   const sourceAssets = Array.isArray(payload.assets) ? payload.assets : [];
   let previousAssets = [];
+  let previousMaterialized = null;
   if (fs.existsSync(jsonPath)) {
     try {
-      previousAssets = JSON.parse(fs.readFileSync(jsonPath, "utf8")).assets || [];
+      previousMaterialized = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
+      previousAssets = previousMaterialized.assets || [];
     } catch {
       previousAssets = [];
     }
@@ -824,19 +1035,47 @@ function syncCharacter(root, payload, expectedKind = "character") {
   }
 
   for (const asset of sourceAssets) {
-    if (!asset || !asset.id || !asset.dataUrl || !referencedIds.has(asset.id)) continue;
-    const folder = asset.kind === "audio" ? "Audio" : "Sprites";
-    const fileName = safeName(asset.name, `${asset.id}.${asset.kind === "audio" ? "wav" : "png"}`);
-    const relativePath = `${folder}/${fileName}`.replace(/\\/g, "/");
-    const fullPath = path.join(dataRoot, folder, fileName);
-    if (writeIfChanged(fullPath, decodeDataUrl(asset.dataUrl))) changedFiles += 1;
-    manifestById.set(asset.id, { id: asset.id, name: asset.name, kind: asset.kind, usage: asset.usage, path: relativePath });
+    const uploadedAssetPath = asset?.id && uploadedAssetPaths ? uploadedAssetPaths.get(String(asset.id)) : "";
+    if (!asset || !asset.id || !referencedIds.has(asset.id)) continue;
+    const assetId = String(asset.id);
+    const previous = manifestById.get(assetId);
+    let relativePath = "";
+    let byteSize = Number(asset.byteSize);
+    let sha256 = isSha256(asset.sha256) ? String(asset.sha256).toLowerCase() : "";
+
+    if (asset.dataUrl || uploadedAssetPath) {
+      const folder = asset.kind === "audio" ? "Audio" : "Sprites";
+      const fileName = safeName(asset.name, `${assetId}.${asset.kind === "audio" ? "wav" : "png"}`);
+      relativePath = `${folder}/${fileName}`.replace(/\\/g, "/");
+      const fullPath = path.join(dataRoot, folder, fileName);
+      const contents = uploadedAssetPath ? fs.readFileSync(uploadedAssetPath) : decodeDataUrl(asset.dataUrl);
+      if (writeIfChanged(fullPath, contents)) changedFiles += 1;
+      byteSize = contents.length;
+      sha256 ||= sha256Buffer(contents);
+    } else {
+      relativePath = String(asset.reusedPath || previous?.path || "").replace(/\\/g, "/");
+      const fullPath = resolveContainedFile(dataRoot, relativePath);
+      if (!fullPath || !fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) {
+        throw new Error(`资源“${asset.name || assetId}”缺少可复用文件，请重新同步`);
+      }
+      if (!Number.isSafeInteger(byteSize) || byteSize <= 0) byteSize = fs.statSync(fullPath).size;
+      sha256 ||= isSha256(previous?.sha256) ? String(previous.sha256).toLowerCase() : sha256File(fullPath);
+    }
+    manifestById.set(assetId, {
+      id: assetId,
+      name: asset.name,
+      kind: asset.kind,
+      usage: asset.usage,
+      path: relativePath,
+      byteSize,
+      sha256,
+    });
   }
 
   const manifestAssets = Array.from(manifestById.values()).filter((asset) => referencedIds.has(asset.id));
   const retainedPaths = new Set(manifestAssets.map((asset) => asset.path));
   for (const asset of previousAssets) {
-    if (!asset?.path || referencedIds.has(asset.id) || retainedPaths.has(asset.path)) continue;
+    if (!asset?.path || retainedPaths.has(asset.path)) continue;
     const fullPath = path.resolve(dataRoot, asset.path);
     const relative = path.relative(dataRoot, fullPath);
     if (relative.startsWith("..") || path.isAbsolute(relative)) continue;
@@ -847,16 +1086,20 @@ function syncCharacter(root, payload, expectedKind = "character") {
     }
   }
 
+  const syncMetadata = {
+    tool: "sprite-cue-studio",
+    runtimePackage: "com.frame-action.runtime",
+    syncedAt: previousMaterialized?.sync?.syncedAt || new Date().toISOString(),
+  };
   const materialized = {
     ...project,
     unityCharacter: { ...(project.unityCharacter || {}), prefabPath },
     assets: manifestAssets,
-    sync: {
-      tool: "sprite-cue-studio",
-      runtimePackage: "com.frame-action.runtime",
-      syncedAt: new Date().toISOString(),
-    },
+    sync: syncMetadata,
   };
+  const withoutSyncTime = (value) => value ? { ...value, sync: { ...(value.sync || {}), syncedAt: "" } } : null;
+  const dataChanged = changedFiles > 0 || JSON.stringify(withoutSyncTime(previousMaterialized)) !== JSON.stringify(withoutSyncTime(materialized));
+  if (dataChanged) materialized.sync.syncedAt = new Date().toISOString();
   if (writeIfChanged(jsonPath, `${JSON.stringify(materialized, null, 2)}\n`)) changedFiles += 1;
   const stampPath = path.join(root, "Assets", "FrameActionData", ".frame-action-sync.json");
   writeIfChanged(stampPath, `${JSON.stringify({ [isEnemy ? "lastEnemy" : "lastCharacter"]: slug, syncedAt: materialized.sync.syncedAt }, null, 2)}\n`);
@@ -1526,6 +1769,27 @@ const server = http.createServer(async (req, res) => {
       const root = validateUnityProject(body.projectPath);
       const runtime = requireCompatibleRuntime(root);
       return sendJson(res, 200, { ok: true, runtime, result: syncCharacter(root, body, "enemy") });
+    }
+    if (req.method === "POST" && url.pathname === "/api/unity/actor-sync/start") {
+      const body = await readBody(req);
+      const root = validateUnityProject(body.projectPath);
+      return sendJson(res, 200, { ok: true, result: startActorSyncUpload(root, body) });
+    }
+    if (req.method === "POST" && url.pathname === "/api/unity/actor-sync/chunk") {
+      const uploadId = String(req.headers["x-frame-action-upload-id"] || "");
+      const assetId = decodeURIComponent(String(req.headers["x-frame-action-asset-id"] || ""));
+      const offset = Number(req.headers["x-frame-action-upload-offset"]);
+      const chunk = await readRawBody(req, ACTOR_ASSET_CHUNK_LIMIT, "单个角色资源分块超过 8MB 限制");
+      return sendJson(res, 200, { ok: true, result: appendActorSyncUpload(uploadId, assetId, offset, chunk) });
+    }
+    if (req.method === "POST" && url.pathname === "/api/unity/actor-sync/finish") {
+      const body = await readBody(req);
+      return sendJson(res, 200, { ok: true, ...finishActorSyncUpload(String(body.uploadId || "")) });
+    }
+    if (req.method === "POST" && url.pathname === "/api/unity/actor-sync/cancel") {
+      const body = await readBody(req);
+      removeActorSyncUpload(String(body.uploadId || ""));
+      return sendJson(res, 200, { ok: true });
     }
     if (req.method === "POST" && url.pathname === "/api/unity/characters") {
       const body = await readBody(req);

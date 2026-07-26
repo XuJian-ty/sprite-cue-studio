@@ -164,12 +164,12 @@ namespace FrameAction
         {
             CurrentMoveAxis = Mathf.Clamp(axis, -1f, 1f);
             if (motor != null) motor.SetMoveInput(CurrentMoveAxis);
-            else ApplyFacing(CurrentMoveAxis);
 
             int direction = CurrentMoveAxis < 0f ? -1 : CurrentMoveAxis > 0f ? 1 : 0;
             if (direction != 0 && direction != _previousMoveDirection) HandleMoveStarted(direction);
             if (direction == 0 && _previousMoveDirection != 0) RunRequested = false;
             controller?.SetLocomotionIntent(CurrentMoveAxis, RunRequested);
+            ApplyFacing(CurrentMoveAxis);
             _previousMoveDirection = direction;
         }
 
@@ -227,7 +227,6 @@ namespace FrameAction
             RunRequested = isDoubleTap;
             if (requested != null) controller?.RequestAction(requested.id);
             if (direction < 0) _lastNegativeTap = now; else _lastPositiveTap = now;
-            ApplyFacing(direction);
         }
 
         private FrameActionData FindAxisAction(string triggerType)
@@ -245,7 +244,14 @@ namespace FrameAction
         private void ApplyFacing(float axis)
         {
             FrameActionMotorSettings settings = player?.Project?.motor;
-            if (player == null || settings == null || !settings.autoFaceMovement || Mathf.Abs(axis) < 0.001f) return;
+            if (player == null
+                || settings == null
+                || !settings.autoFaceMovement
+                || Mathf.Abs(axis) < 0.001f
+                || controller != null && controller.IsLocomotionInputLocked)
+            {
+                return;
+            }
             player.facingLeft = axis < 0f;
         }
 

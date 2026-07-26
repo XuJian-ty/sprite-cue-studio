@@ -7,6 +7,8 @@ export interface AssetRef {
   usage?: "character" | "vfx" | "audio";
   url: string;
   dataUrl?: string;
+  byteSize?: number;
+  sha256?: string;
   width?: number;
   height?: number;
   durationSeconds?: number;
@@ -70,6 +72,8 @@ export interface CharacterAction {
   name: string;
   type: "idleGround" | "idleAir" | "move" | "jump" | "dropThrough" | "attack" | "skill" | "hurt" | "custom";
   loop: boolean;
+  acceptMovementInput: boolean;
+  acceptJumpInput: boolean;
   comboCount: number;
   comboWindow: number;
   repeatWindow: number;
@@ -109,6 +113,7 @@ export interface CharacterMotorSettings {
 
 export interface UnityCharacterSettings {
   prefabPath: string;
+  actorLayerName: string;
   collideWithOtherActors: boolean;
   colliderShape: "capsule" | "box";
   colliderWidth: number;
@@ -191,7 +196,7 @@ export interface EnemyBehaviorNode {
 
 export interface CharacterProject {
   format: "frame-action-project";
-  version: 6;
+  version: 11;
   projectKind: "character" | "enemy";
   tickRate: number;
   characterName: string;

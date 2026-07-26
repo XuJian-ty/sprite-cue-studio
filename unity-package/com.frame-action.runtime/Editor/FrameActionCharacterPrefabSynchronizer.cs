@@ -7,10 +7,13 @@ namespace FrameAction.Editor
 {
     internal static class FrameActionCharacterPrefabSynchronizer
     {
-        private const int PlayerSortingOrder = 10;
-        private const int PlayerVfxSortingOrder = 12;
-        private const int EnemyMaximumSortingOrder = 9;
-        private const int EnemyVfxSortingOrder = 11;
+        private const int EnemyVfxBackSortingOrder = -1500;
+        private const int EnemyMinimumSortingOrder = -1000;
+        private const int EnemyMaximumSortingOrder = 0;
+        private const int PlayerVfxBackSortingOrder = 250;
+        private const int PlayerSortingOrder = 500;
+        private const int EnemyVfxSortingOrder = 1000;
+        private const int PlayerVfxSortingOrder = 1500;
 
         public static string Synchronize(FrameActionProjectData data, FrameActionCharacterAsset characterAsset, string outputFolder, string slug)
         {
@@ -63,6 +66,7 @@ namespace FrameAction.Editor
         private static void ConfigureEnemy(GameObject root, FrameActionProjectData data, FrameActionCharacterAsset characterAsset, FrameActionUnityCharacterSettings settings)
         {
             root.name = string.IsNullOrWhiteSpace(data.characterName) ? "Frame Action Enemy" : data.characterName;
+            root.layer = EnsureUnityLayer(settings.actorLayerName, "Enemy");
             Rigidbody2D body = GetOrAdd<Rigidbody2D>(root);
             body.bodyType = RigidbodyType2D.Dynamic;
             body.mass = Mathf.Max(0.01f, settings.rigidbodyMass);
@@ -102,6 +106,7 @@ namespace FrameAction.Editor
             controller.player = player;
             controller.playGroundIdleOnEnable = behavior.playGroundIdleOnEnable;
             controller.returnToIdleOnComplete = behavior.returnToIdleOnComplete;
+            controller.autoPlayDamageReaction = true;
             enemyMotor.controller = controller;
             enemyMotor.body = body;
             enemyMotor.bodyCollider = bodyCollider;
@@ -116,17 +121,20 @@ namespace FrameAction.Editor
             renderOrder.targetRenderer = renderer;
             renderOrder.bodyCollider = bodyCollider;
             renderOrder.depthBucketsPerWorldUnit = 4f;
-            renderOrder.minimumSortingOrder = -900;
+            renderOrder.minimumSortingOrder = EnemyMinimumSortingOrder;
             renderOrder.maximumSortingOrder = EnemyMaximumSortingOrder;
             handler.player = player;
             handler.ownerBody = body;
+            handler.vfxSortingLayer = renderer.sortingLayerName;
             handler.vfxSortingOrder = EnemyVfxSortingOrder;
+            handler.vfxBackSortingOrder = EnemyVfxBackSortingOrder;
             handler.cameraReceiverBehaviour = null;
         }
 
         private static void ConfigureCharacter(GameObject root, FrameActionProjectData data, FrameActionCharacterAsset characterAsset, FrameActionUnityCharacterSettings settings)
         {
             root.name = string.IsNullOrWhiteSpace(data.characterName) ? "Frame Action Character" : data.characterName;
+            root.layer = EnsureUnityLayer(settings.actorLayerName, "Player");
             RemoveManagedComponent<FrameActionEnemyBehaviorRunner2D>(root);
             RemoveManagedComponent<FrameActionEnemyMotor2D>(root);
             RemoveManagedComponent<FrameActionEnemyController2D>(root);
@@ -174,7 +182,9 @@ namespace FrameAction.Editor
             actorCollision.collideWithOtherActors = settings.collideWithOtherActors;
             handler.player = player;
             handler.ownerBody = body;
+            handler.vfxSortingLayer = renderer.sortingLayerName;
             handler.vfxSortingOrder = PlayerVfxSortingOrder;
+            handler.vfxBackSortingOrder = PlayerVfxBackSortingOrder;
             ConfigureCameraFollow(cameraFollow, root.transform, data.cameraFollow);
             handler.cameraReceiverBehaviour = cameraFollow;
         }
@@ -279,7 +289,7 @@ namespace FrameAction.Editor
             }
             renderer = visual.GetComponent<SpriteRenderer>();
             if (renderer == null) renderer = visual.gameObject.AddComponent<SpriteRenderer>();
-            renderer.sortingOrder = 10;
+            renderer.sortingOrder = PlayerSortingOrder;
             return renderer;
         }
 
@@ -359,6 +369,28 @@ namespace FrameAction.Editor
                 if (!AssetDatabase.IsValidFolder(next)) AssetDatabase.CreateFolder(current, parts[i]);
                 current = next;
             }
+        }
+
+        private static int EnsureUnityLayer(string configuredName, string fallbackName)
+        {
+            string layerName = string.IsNullOrWhiteSpace(configuredName) ? fallbackName : configuredName.Trim();
+            int existing = LayerMask.NameToLayer(layerName);
+            if (existing >= 0) return existing;
+
+            UnityEngine.Object[] assets = AssetDatabase.LoadAllAssetsAtPath("ProjectSettings/TagManager.asset");
+            if (assets == null || assets.Length == 0) throw new InvalidOperationException("Unable to load ProjectSettings/TagManager.asset.");
+            SerializedObject tagManager = new SerializedObject(assets[0]);
+            SerializedProperty layers = tagManager.FindProperty("layers");
+            for (int index = 8; index < layers.arraySize; index++)
+            {
+                SerializedProperty layer = layers.GetArrayElementAtIndex(index);
+                if (!string.IsNullOrEmpty(layer.stringValue)) continue;
+                layer.stringValue = layerName;
+                tagManager.ApplyModifiedProperties();
+                AssetDatabase.SaveAssets();
+                return index;
+            }
+            throw new InvalidOperationException($"No empty Unity Layer slot is available for '{layerName}'.");
         }
     }
 }

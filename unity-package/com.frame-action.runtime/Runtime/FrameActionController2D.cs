@@ -23,7 +23,11 @@ namespace FrameAction
             get
             {
                 FrameActionData action = player?.CurrentAction;
-                return player != null && player.IsPlaying && action != null && action.type == "attack";
+                if (player == null || !player.IsPlaying || action == null) return false;
+                bool acceptsMovementInput = player.Project?.version >= 7
+                    ? action.acceptMovementInput
+                    : action.type != "attack";
+                return !acceptsMovementInput;
             }
         }
         public FrameActionStateMachine2D StateMachine => EnsureStateMachine();
@@ -75,10 +79,11 @@ namespace FrameAction
             _wasStunned = stunned;
         }
 
-        public void SetGrounded(bool value)
+        public void SetGrounded(bool value, bool updateLocomotion = true)
         {
             if (grounded == value) return;
             grounded = value;
+            if (!updateLocomotion) return;
             FrameActionData current = player?.CurrentAction;
             if (current != null && IsLocomotionAction(current)) PlayLocomotionOrIdle();
         }

@@ -271,7 +271,7 @@ namespace FrameAction
                 Vector2 relativeVelocity = velocity - _groundPointVelocity;
                 float currentSurfaceSpeed = Vector2.Dot(relativeVelocity, tangent);
                 float targetSurfaceSpeed = effectiveInput * speed * movementMultiplier;
-                // Attacks lock ordinary locomotion immediately instead of letting
+                // Actions can lock ordinary locomotion immediately instead of letting
                 // the previous run velocity decay into a visible slide. Scripted
                 // timeline motion is handled above and never reaches this branch.
                 float nextSurfaceSpeed = inputLocked
@@ -301,11 +301,16 @@ namespace FrameAction
         private void TryConsumeJump(FrameActionMotorSettings settings)
         {
             if (_queuedJumpAction?.segments == null || _queuedJumpAction.segments.Count == 0) return;
+            if (controller != null && controller.IsStunned) return;
             int jumpIndex;
             if (IsGrounded || _coyoteTimer > 0f) jumpIndex = 0;
             else jumpIndex = Mathf.Max(1, _jumpsUsed);
             if (jumpIndex >= _queuedJumpAction.segments.Count) return;
-            if (controller != null && !controller.RequestActionSegment(_queuedJumpAction.id, jumpIndex)) return;
+            bool preserveCurrentAction = player != null
+                && player.IsPlaying
+                && player.CurrentAction != null
+                && player.CurrentAction.acceptJumpInput;
+            if (!preserveCurrentAction && controller != null && !controller.RequestActionSegment(_queuedJumpAction.id, jumpIndex)) return;
 
             FrameActionSegmentData jumpSegment = _queuedJumpAction.segments[jumpIndex];
             float gravity = Mathf.Abs(Physics2D.gravity.y * Mathf.Max(0.01f, settings.gravityScale));
@@ -315,7 +320,7 @@ namespace FrameAction
             velocity.y = jumpVelocity + _groundPointVelocity.y;
             BodyVelocity = velocity;
             IsGrounded = false;
-            controller?.SetGrounded(false);
+            controller?.SetGrounded(false, !preserveCurrentAction);
             _jumpsUsed = jumpIndex + 1;
             _coyoteTimer = 0f;
             _jumpBufferTimer = 0f;

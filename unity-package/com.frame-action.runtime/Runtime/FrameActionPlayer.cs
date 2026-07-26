@@ -524,7 +524,8 @@ namespace FrameAction
             {
                 foreach (JObject effect in Objects(data.parameters?["damageEffects"]))
                 {
-                    tail = Mathf.Max(tail, ValueInt(effect, "detectionDurationTicks"));
+                    tail = Mathf.Max(tail, Mathf.Max(0, ValueInt(effect, "triggerDelayTicks"))
+                        + Mathf.Max(0, ValueInt(effect, "detectionDurationTicks")));
                 }
             }
             else if (kind == "physics")
@@ -533,7 +534,7 @@ namespace FrameAction
                 {
                     int lifetime = ValueString(effect, "durationMode") == "untilActionEnd"
                         ? remainingTicks
-                        : ValueInt(effect, "durationTicks");
+                        : Mathf.Max(0, ValueInt(effect, "delayTicks")) + Mathf.Max(0, ValueInt(effect, "durationTicks"));
                     tail = Mathf.Max(tail, lifetime);
                 }
             }
@@ -556,30 +557,32 @@ namespace FrameAction
 
         private int GetVfxLifetimeTicks(JObject effect, int remainingTicks)
         {
+            int triggerDelayTicks = Mathf.Max(0, ValueInt(effect, "triggerDelayTicks"));
             if (ValueBool(effect, "loop"))
             {
                 string destroyMode = ValueString(effect, "destroyMode");
                 if (destroyMode == "onActionEnd") return remainingTicks;
-                if (destroyMode == "timed") return Mathf.Max(0, ValueInt(effect, "durationTicks"));
-                return 0;
+                if (destroyMode == "timed") return triggerDelayTicks + Mathf.Max(0, ValueInt(effect, "durationTicks"));
+                return triggerDelayTicks;
             }
             int frameCount = (effect?["frameAssetIds"] as JArray)?.Values<string>().Count(value => !string.IsNullOrEmpty(value)) ?? 0;
             if (frameCount == 0 && !string.IsNullOrEmpty(ValueString(effect, "assetId"))) frameCount = 1;
             float fps = Mathf.Max(1f, ValueFloat(effect, "fps", 12f));
-            return frameCount > 0 ? Mathf.CeilToInt(frameCount * TickRate / fps) : 0;
+            return triggerDelayTicks + (frameCount > 0 ? Mathf.CeilToInt(frameCount * TickRate / fps) : 0);
         }
 
         private int GetSfxLifetimeTicks(JObject effect, int remainingTicks)
         {
+            int triggerDelayTicks = Mathf.Max(0, ValueInt(effect, "triggerDelayTicks"));
             if (ValueBool(effect, "loop"))
             {
                 string destroyMode = ValueString(effect, "destroyMode");
                 if (destroyMode == "onActionEnd") return remainingTicks;
-                if (destroyMode == "timed") return Mathf.Max(0, ValueInt(effect, "durationTicks"));
-                return 0;
+                if (destroyMode == "timed") return triggerDelayTicks + Mathf.Max(0, ValueInt(effect, "durationTicks"));
+                return triggerDelayTicks;
             }
             AudioClip clip = characterAsset != null ? characterAsset.FindAsset<AudioClip>(ValueString(effect, "assetId")) : null;
-            return clip != null ? Mathf.CeilToInt(Mathf.Max(0f, clip.length) * TickRate) : 0;
+            return triggerDelayTicks + (clip != null ? Mathf.CeilToInt(Mathf.Max(0f, clip.length) * TickRate) : 0);
         }
 
         private static IEnumerable<JObject> Objects(JToken token)

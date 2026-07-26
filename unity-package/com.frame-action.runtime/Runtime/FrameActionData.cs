@@ -101,6 +101,7 @@ namespace FrameAction
     public sealed class FrameActionUnityCharacterSettings
     {
         public string prefabPath = "";
+        public string actorLayerName = "";
         public bool collideWithOtherActors;
         public string colliderShape = "capsule";
         public float colliderWidth = 0.6f;
@@ -140,6 +141,8 @@ namespace FrameAction
         public string name;
         public string type;
         public bool loop;
+        public bool acceptMovementInput = true;
+        public bool acceptJumpInput;
         public int comboCount = 1;
         public float comboWindow = 0.12f;
         public float repeatWindow = 0.28f;

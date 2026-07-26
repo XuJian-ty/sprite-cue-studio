@@ -221,7 +221,8 @@ function eventTriggerTicksUntil(event: TimelineEvent, tick: number, actionEndTic
 function damageActivationTicks(effect: any, triggerTick: number, tick: number): number[] {
   const detectionDuration = Math.max(0, Number(effect.detectionDurationTicks || 0));
   const activationTick = Math.min(Math.max(0, Number(effect.activationTick || 0)), detectionDuration);
-  const firstTick = triggerTick + activationTick;
+  const effectiveStart = triggerTick + Math.max(0, Number(effect.triggerDelayTicks || 0));
+  const firstTick = effectiveStart + activationTick;
   if (firstTick > tick) return [];
   const intermittent = (effect.activationMode || "continuous") === "intermittent";
   const perActivation = (effect.deduplicationScope || "wholeEvent") === "perActivation";
@@ -310,9 +311,11 @@ function damageAnchorTick(effect: any, detectionType: string, triggerTick: numbe
   return Math.min(sampleTick, triggerTick + Math.max(0, Number(effect.followDurationTicks || 0)));
 }
 
-function damagePreviewWindow(event: TimelineEvent, effect: any, tick: number, tickRate: number, actionEndTick: number): { start: number; hitTick: number; active: boolean } | null {
-  const triggerTick = eventTriggerTick(event, tick, actionEndTick);
+function damagePreviewWindow(event: TimelineEvent, effect: any, tick: number, tickRate: number, actionEndTick: number): { trigger: number; start: number; hitTick: number; active: boolean } | null {
+  const triggerDelay = Math.max(0, Number(effect.triggerDelayTicks || 0));
+  const triggerTick = eventTriggerTick(event, tick - triggerDelay, actionEndTick);
   if (triggerTick === null) return null;
+  const effectiveStart = triggerTick + triggerDelay;
   const detectionDuration = Math.max(0, Number(effect.detectionDurationTicks || 0));
   const activation = Math.min(Math.max(0, Number(effect.activationTick || 0)), detectionDuration);
   const physicsLifetime = Math.max(0, ...(effect.onHitPhysicsEffects || []).map((item: any) => Number(item.delayTicks || 0) + Number(item.durationTicks || 0)));
@@ -321,7 +324,7 @@ function damagePreviewWindow(event: TimelineEvent, effect: any, tick: number, ti
   const damageLifetime = Math.max(0, ...(effect.onHitDamageEffects || []).map((item: any) => Number(item.delayTicks || 0)));
   // This only keeps already-triggered hit feedback visible in the preview. It is not the damage event's timeline duration.
   const lifetime = Math.max(detectionDuration, activation + Math.max(physicsLifetime, vfxLifetime, sfxLifetime, damageLifetime));
-  const elapsed = tick - triggerTick;
+  const elapsed = tick - effectiveStart;
   if (elapsed < 0 || elapsed > lifetime) return null;
   const activationElapsed = elapsed - activation;
   let active = activationElapsed >= 0 && (detectionDuration <= 0 ? activationElapsed <= 1 : elapsed <= detectionDuration);
@@ -339,8 +342,8 @@ function damagePreviewWindow(event: TimelineEvent, effect: any, tick: number, ti
   const cycleTicks = Math.max(1, Number(effect.intermittentActiveTicks || 1)) + Math.max(0, Number(effect.intermittentIntervalTicks || 0));
   const hitTick = deduplication === "perDetection"
     ? tick
-    : triggerTick + activation + (deduplication === "perActivation" ? activationCycle * cycleTicks : 0);
-  return { start: triggerTick, hitTick, active };
+    : effectiveStart + activation + (deduplication === "perActivation" ? activationCycle * cycleTicks : 0);
+  return { trigger: triggerTick, start: effectiveStart, hitTick, active };
 }
 
 function pointHitsDamage(targetCenter: Point, preview: Omit<DamagePreview, "hit">): boolean {
@@ -537,6 +540,7 @@ export default function PreviewCanvas(props: Props) {
           if (progress === null) continue;
           if (effect.effectType === "dashSelf") offset.x += Number(effect.distance || 0) * progress * currentFacingSign;
           if (effect.effectType === "airborne") offset.y += Number(effect.height || 0) * 4 * progress * (1 - progress);
+          if (effect.effectType === "hover") statuses.push("滞空");
           if (effect.effectType === "superArmor") statuses.push("霸体");
           if (effect.effectType === "invincible") statuses.push("无敌");
         }
@@ -694,10 +698,13 @@ export default function PreviewCanvas(props: Props) {
       const records: TargetPhysicsRecord[] = [];
       for (const opportunity of opportunities) {
         const { event, effect, effectIndex, triggerTick, hitTick } = opportunity;
+        const effectiveStart = triggerTick + Math.max(0, Number(effect.triggerDelayTicks || 0));
         const detectionType = effect.detectionType || "rangeOverlap";
         const anchorMode = effect.anchor || "world";
         const casterAtTrigger = evaluateCaster(triggerTick);
-        const anchorTick = damageAnchorTick(effect, detectionType, triggerTick, hitTick);
+        const anchorTick = hitTick <= effectiveStart
+          ? triggerTick
+          : damageAnchorTick(effect, detectionType, effectiveStart, hitTick);
         const casterAtHit = evaluateCaster(hitTick);
         const casterAtAnchor = evaluateCaster(anchorTick);
         const targetAtAnchorOffset = resolveTargetPhysicsOffset(anchorTick, records);
@@ -717,7 +724,7 @@ export default function PreviewCanvas(props: Props) {
         const retargetOrigin = detectionType === "raycast"
           ? { x: casterAtHit.position.x + Number(effect.rayOriginX || 0) * casterAtHit.facingSign, y: casterAtHit.position.y + Number(effect.rayOriginY || 0) }
           : { x: casterAtHit.position.x + Number(effect.centerX || 0) * casterAtHit.facingSign, y: casterAtHit.position.y + Number(effect.centerY || 0) };
-        const elapsedTicks = hitTick - triggerTick;
+        const elapsedTicks = hitTick - effectiveStart;
         const motion = detectionType === "physicalEntity"
           ? evaluatePhysicalEntityMotion(effect, elapsedTicks, project.tickRate, effectFacingSign, motionOrigin, retargetOrigin)
           : evaluateMotion(effect.motion, elapsedTicks, project.tickRate, effectFacingSign, motionOrigin, retargetOrigin);
@@ -735,7 +742,7 @@ export default function PreviewCanvas(props: Props) {
           facingSign: effectFacingSign,
           boxWidth: growth.width,
           boxHeight: growth.height,
-          activeStart: triggerTick,
+          activeStart: effectiveStart,
           hitTick,
           active: true,
           exists: true,
@@ -766,8 +773,8 @@ export default function PreviewCanvas(props: Props) {
       }
       const offset = resolveTargetPhysicsOffset(tick, records);
       const statuses = records
-        .filter((record) => record.type === "stun" && tick >= record.startTick && tick <= record.endTick)
-        .map(() => "眩晕");
+        .filter((record) => ["stun", "hover"].includes(record.type) && tick >= record.startTick && tick <= record.endTick)
+        .map((record) => record.type === "hover" ? "滞空" : "眩晕");
       const result = { position: { x: targetBase.x + offset.x, y: targetBase.y + offset.y }, statuses };
       targetStateCache.set(cacheKey, result);
       return result;
@@ -777,18 +784,22 @@ export default function PreviewCanvas(props: Props) {
       (event.params.damageEffects || []).forEach((effect: any, effectIndex: number) => {
         const window = damagePreviewWindow(event, effect, playheadTick, project.tickRate, actionEndTick)
           ?? (sceneEditMode && event.id === selectedEventId ? {
-            start: event.startTick,
-            hitTick: event.startTick + Math.min(Math.max(0, Number(effect.activationTick || 0)), Math.max(0, Number(effect.detectionDurationTicks || 0))),
+            trigger: event.startTick,
+            start: event.startTick + Math.max(0, Number(effect.triggerDelayTicks || 0)),
+            hitTick: event.startTick + Math.max(0, Number(effect.triggerDelayTicks || 0)) + Math.min(Math.max(0, Number(effect.activationTick || 0)), Math.max(0, Number(effect.detectionDurationTicks || 0))),
             active: true,
           } : null);
         if (window === null) return;
+        const releaseTick = window.trigger;
         const activeStart = window.start;
         const detectionType = effect.detectionType || "rangeOverlap";
         const anchorMode = effect.anchor || "world";
         const fixedRepeatedAnchor = anchorMode === "world" && event.triggerMode === "repeated" && event.params.repeatedAnchorMode === "fixed";
         const followsAnchor = anchorMode !== "world" && detectionType !== "physicalEntity";
-        const activeCasterState = evaluateCaster(activeStart);
-        const anchorTick = damageAnchorTick(effect, detectionType, activeStart, playheadTick);
+        const activeCasterState = evaluateCaster(releaseTick);
+        const anchorTick = playheadTick <= activeStart
+          ? releaseTick
+          : damageAnchorTick(effect, detectionType, activeStart, playheadTick);
         const anchorCasterState = evaluateCaster(anchorTick);
         const anchorState = fixedRepeatedAnchor
           ? evaluateCaster(event.startTick)
@@ -819,7 +830,9 @@ export default function PreviewCanvas(props: Props) {
         const base = { event, effect, effectIndex, detectionType, center, motionOrigin, rotation: physicalRotation, facingSign: effectFacingSign, boxWidth: growth.width, boxHeight: growth.height, activeStart, hitTick: window.hitTick, active: window.active, exists };
         const hitCasterState = evaluateCaster(window.hitTick);
         const hitCaster = hitCasterState.position;
-        const hitAnchorTick = damageAnchorTick(effect, detectionType, activeStart, window.hitTick);
+        const hitAnchorTick = window.hitTick <= activeStart
+          ? releaseTick
+          : damageAnchorTick(effect, detectionType, activeStart, window.hitTick);
         const hitAnchorCasterState = evaluateCaster(hitAnchorTick);
         const hitAnchorState = fixedRepeatedAnchor
           ? evaluateCaster(event.startTick)
@@ -937,17 +950,31 @@ export default function PreviewCanvas(props: Props) {
       }
     };
 
-    for (const event of segment.tracks.find((track) => track.kind === "vfx")?.events || []) {
-      const triggerTick = eventTriggerTick(event, playheadTick, actionEndTick);
-      if (triggerTick === null) continue;
-      (event.params.vfxEffects || []).forEach((effect: any, effectIndex: number) => drawCueImage(effect, triggerTick, undefined, undefined, { event, location: { scope: "top", effectIndex } }));
-    }
-    for (const preview of previews) {
-      const detectionDuration = Math.max(0, Number(preview.effect.detectionDurationTicks || 0));
-      const detectionLifetime = detectionDuration;
-      (preview.effect.companionVfxEffects || []).forEach((effect: any, effectIndex: number) => drawCueImage(effect, preview.activeStart, preview.center, Math.max(1, detectionLifetime), { event: preview.event, location: { scope: "companion", damageIndex: preview.effectIndex, effectIndex } }, preview.detectionType === "physicalEntity" ? preview.rotation : 0));
-      if (preview.hit) (preview.effect.onHitVfxEffects || []).forEach((effect: any, effectIndex: number) => drawCueImage(effect, preview.hitTick + Number(effect.triggerDelayTicks || 0), targetCenterBase, undefined, { event: preview.event, location: { scope: "hit", damageIndex: preview.effectIndex, effectIndex } }));
-    }
+    const drawVfxLayer = (renderLayer: "front" | "back") => {
+      let hasEffects = false;
+      const draw = (effect: any, callback: () => void) => {
+        const resolvedLayer = effect.renderLayer === "back" ? "back" : "front";
+        if (resolvedLayer !== renderLayer) return;
+        hasEffects = true;
+        callback();
+      };
+      for (const event of segment.tracks.find((track) => track.kind === "vfx")?.events || []) {
+        (event.params.vfxEffects || []).forEach((effect: any, effectIndex: number) => {
+          const delay = Math.max(0, Number(effect.triggerDelayTicks || 0));
+          const triggerTick = eventTriggerTick(event, playheadTick - delay, actionEndTick);
+          if (triggerTick !== null) draw(effect, () => drawCueImage(effect, triggerTick + delay, undefined, undefined, { event, location: { scope: "top", effectIndex } }));
+        });
+      }
+      for (const preview of previews) {
+        const detectionDuration = Math.max(0, Number(preview.effect.detectionDurationTicks || 0));
+        (preview.effect.companionVfxEffects || []).forEach((effect: any, effectIndex: number) => draw(effect, () => drawCueImage(effect, preview.activeStart, preview.center, Math.max(1, detectionDuration), { event: preview.event, location: { scope: "companion", damageIndex: preview.effectIndex, effectIndex } }, preview.detectionType === "physicalEntity" ? preview.rotation : 0)));
+        if (preview.hit) (preview.effect.onHitVfxEffects || []).forEach((effect: any, effectIndex: number) => draw(effect, () => drawCueImage(effect, preview.hitTick + Number(effect.triggerDelayTicks || 0), targetCenterBase, undefined, { event: preview.event, location: { scope: "hit", damageIndex: preview.effectIndex, effectIndex } })));
+      }
+      return hasEffects;
+    };
+
+    if (drawVfxLayer("back")) drawFrame();
+    drawVfxLayer("front");
 
     damageGeometry.current = [];
     if (showBoxes) {
@@ -1034,9 +1061,11 @@ export default function PreviewCanvas(props: Props) {
       context.restore();
     };
     for (const event of segment.tracks.find((track) => track.kind === "sfx")?.events || []) {
-      const triggerTick = eventTriggerTick(event, playheadTick, actionEndTick);
-      if (triggerTick === null) continue;
-      for (const effect of event.params.sfxEffects || []) drawAudioCue(effect, triggerTick);
+      for (const effect of event.params.sfxEffects || []) {
+        const delay = Math.max(0, Number(effect.triggerDelayTicks || 0));
+        const triggerTick = eventTriggerTick(event, playheadTick - delay, actionEndTick);
+        if (triggerTick !== null) drawAudioCue(effect, triggerTick + delay);
+      }
     }
     for (const preview of previews.filter((item) => item.hit)) {
       for (const effect of preview.effect.onHitSfxEffects || []) drawAudioCue(effect, preview.hitTick + Number(effect.triggerDelayTicks || 0), targetCenterBase);

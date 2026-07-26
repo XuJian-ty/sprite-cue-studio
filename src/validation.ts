@@ -76,6 +76,7 @@ export function validateProject(project: CharacterProject, assets: Record<string
     if (number(effect?.pixelsPerUnit, project.pixelsPerUnit) <= 0) add("error", `${label}的 PPU 必须大于 0`, location);
     if (number(effect?.pivotX, 0.5) < 0 || number(effect?.pivotX, 0.5) > 1) add("error", `${label}的 Pivot X 必须在 0 到 1 之间`, location);
     if (number(effect?.pivotY, 0.5) < 0 || number(effect?.pivotY, 0.5) > 1) add("error", `${label}的 Pivot Y 必须在 0 到 1 之间`, location);
+    if (effect?.renderLayer !== undefined && !["front", "back"].includes(effect.renderLayer)) add("error", `${label}的渲染层级无效`, location);
     const loop = !forceOneShot && Boolean(effect?.loop);
     if (loop && !["timed", "onActionEnd", "detectionEnd"].includes(effect?.destroyMode)) add("error", `${label}循环结束条件无效`, location);
     if (loop && effect?.destroyMode === "timed" && number(effect?.durationTicks) <= 0) add("error", `${label}指定时长必须大于 0`, location);
@@ -108,6 +109,7 @@ export function validateProject(project: CharacterProject, assets: Record<string
       if (!effects.length) add("warning", "命中事件没有检测效果", location);
       effects.forEach((effect: any, index: number) => {
         const label = `命中检测 ${index + 1}`;
+        if (number(effect.triggerDelayTicks) < 0) add("error", `${label}的生效延迟不能小于 0`, location);
         if (!String(effect.hitLayerName || "").trim()) add("error", `${label}的命中层为空`, location);
         const detectionType = effect.detectionType || "rangeOverlap";
         if (detectionType === "raycast") {
@@ -146,13 +148,20 @@ export function validateProject(project: CharacterProject, assets: Record<string
           add("error", `${label}的激活时刻不能大于${durationLabel}`, location);
         }
         if (effect.activationMode === "intermittent" && number(effect.intermittentActiveTicks) <= 0) add("error", `${label}的间歇激活时长必须大于 0`, location);
+        (effect.onHitPhysicsEffects || []).forEach((physics: any, physicsIndex: number) => {
+          if (physics.effectType === "hover" && number(physics.durationTicks) <= 0) add("error", `${label}命中滞空 ${physicsIndex + 1} 的持续时长必须大于 0`, location);
+        });
         if ((effect.anchor || "world") === "world") validateMotion(effect.motion, label, location);
         (effect.companionVfxEffects || []).forEach((cue: any, cueIndex: number) => validateVfx(cue, `${label}伴随特效 ${cueIndex + 1}`, location));
         (effect.onHitVfxEffects || []).forEach((cue: any, cueIndex: number) => validateVfx(cue, `${label}命中特效 ${cueIndex + 1}`, location, true));
         (effect.onHitSfxEffects || []).forEach((cue: any, cueIndex: number) => validateSfx(cue, `${label}命中音效 ${cueIndex + 1}`, location, true));
       });
     } else if (kind === "physics") {
-      if (!(event.params.physicsEffects || []).length) add("warning", "物理事件没有物理效果", location);
+      const effects = event.params.physicsEffects || [];
+      if (!effects.length) add("warning", "物理事件没有物理效果", location);
+      effects.forEach((effect: any, index: number) => {
+        if (effect.effectType === "hover" && number(effect.durationTicks) <= 0) add("error", `滞空效果 ${index + 1} 的持续时长必须大于 0`, location);
+      });
     } else if (kind === "vfx") {
       const effects = event.params.vfxEffects || [];
       if (!effects.length) add("warning", "特效事件没有特效", location);

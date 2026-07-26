@@ -25,8 +25,13 @@ namespace FrameAction
         private CollisionDetectionMode2D _previousCollisionDetectionMode;
         private bool _restoreCollisionDetectionMode;
         private int _generation;
+        private float _hoverElapsed;
+        private float _hoverDuration;
+        private float _gravityScaleBeforeHover;
+        private int _hoverGeneration;
 
         public bool IsActive { get; private set; }
+        public bool IsHoverActive { get; private set; }
         public int Generation => _generation;
 
         private void Awake()
@@ -39,6 +44,7 @@ namespace FrameAction
         {
             if (IsActive) StopHorizontalMotion();
             Finish();
+            FinishHover();
         }
 
         public static bool IsActiveOn(Rigidbody2D body)
@@ -79,6 +85,33 @@ namespace FrameAction
             return _generation;
         }
 
+        public int BeginHover(float duration)
+        {
+            if (_body == null) _body = GetComponent<Rigidbody2D>();
+            if (_body == null || _body.bodyType != RigidbodyType2D.Dynamic) return _hoverGeneration;
+
+            _hoverGeneration++;
+            _hoverElapsed = 0f;
+            _hoverDuration = Mathf.Max(Time.fixedDeltaTime, duration);
+            if (!IsHoverActive) _gravityScaleBeforeHover = _body.gravityScale;
+            IsHoverActive = true;
+            _body.gravityScale = 0f;
+            StopVerticalMotion();
+            _body.WakeUp();
+            return _hoverGeneration;
+        }
+
+        public bool IsHoverActiveFor(int generation)
+        {
+            return IsHoverActive && generation == _hoverGeneration;
+        }
+
+        public void CancelHover(int generation)
+        {
+            if (generation != _hoverGeneration) return;
+            FinishHover();
+        }
+
         public bool IsActiveFor(int generation)
         {
             return IsActive && generation == _generation;
@@ -100,6 +133,7 @@ namespace FrameAction
 
         private void FixedUpdate()
         {
+            UpdateHover();
             if (!IsActive || _body == null || _body.bodyType != RigidbodyType2D.Dynamic || !_body.simulated)
             {
                 if (IsActive && (_body == null || _body.bodyType != RigidbodyType2D.Dynamic || !_body.simulated)) Finish();
@@ -123,11 +157,37 @@ namespace FrameAction
             _elapsed += Time.fixedDeltaTime;
         }
 
+        private void UpdateHover()
+        {
+            if (!IsHoverActive) return;
+            if (_body == null || _body.bodyType != RigidbodyType2D.Dynamic || !_body.simulated)
+            {
+                FinishHover();
+                return;
+            }
+            if (_hoverElapsed + 0.0001f >= _hoverDuration)
+            {
+                FinishHover();
+                return;
+            }
+            _body.gravityScale = 0f;
+            StopVerticalMotion();
+            _hoverElapsed += Time.fixedDeltaTime;
+        }
+
         private void StopHorizontalMotion()
         {
             if (_body == null || _body.bodyType != RigidbodyType2D.Dynamic) return;
             Vector2 velocity = BodyVelocity;
             velocity.x = 0f;
+            BodyVelocity = velocity;
+        }
+
+        private void StopVerticalMotion()
+        {
+            if (_body == null || _body.bodyType != RigidbodyType2D.Dynamic) return;
+            Vector2 velocity = BodyVelocity;
+            velocity.y = 0f;
             BodyVelocity = velocity;
         }
 
@@ -143,6 +203,14 @@ namespace FrameAction
             _groundLayerMask = 0;
             if (_body != null && _restoreCollisionDetectionMode) _body.collisionDetectionMode = _previousCollisionDetectionMode;
             _restoreCollisionDetectionMode = false;
+        }
+
+        private void FinishHover()
+        {
+            if (IsHoverActive && _body != null) _body.gravityScale = _gravityScaleBeforeHover;
+            IsHoverActive = false;
+            _hoverElapsed = 0f;
+            _hoverDuration = 0f;
         }
 
         private void ResolveGroundAdhesion()

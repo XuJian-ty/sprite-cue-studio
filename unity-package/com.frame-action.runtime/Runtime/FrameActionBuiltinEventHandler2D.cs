@@ -20,7 +20,8 @@ namespace FrameAction
         public MonoBehaviour hitStopReceiverBehaviour;
         public bool applyHitStop = true;
         public string vfxSortingLayer = "Default";
-        public int vfxSortingOrder = 10;
+        public int vfxSortingOrder = 1500;
+        public int vfxBackSortingOrder = 250;
 
         private readonly List<GameObject> _liveObjects = new List<GameObject>();
         private readonly Dictionary<int, List<GameObject>> _actionBoundObjects = new Dictionary<int, List<GameObject>>();
@@ -50,6 +51,22 @@ namespace FrameAction
             {
                 this.position = position;
                 this.rotation = rotation;
+            }
+        }
+
+        private readonly struct VfxVisualSettings
+        {
+            public readonly Vector2 offset;
+            public readonly Vector2 pivotOffset;
+            public readonly float rotation;
+            public readonly float scale;
+
+            public VfxVisualSettings(Vector2 offset, Vector2 pivotOffset, float rotation, float scale)
+            {
+                this.offset = offset;
+                this.pivotOffset = pivotOffset;
+                this.rotation = rotation;
+                this.scale = scale;
             }
         }
 
@@ -125,8 +142,10 @@ namespace FrameAction
 
         private IEnumerator RunDamageEffect(FrameActionEventContext context, JObject effect)
         {
+            effect = (JObject)effect.DeepClone();
             FrameTimelineEventData eventData = context.data;
             Transform source = player != null ? player.transform : transform;
+            float releaseFacingSign = FacingSign;
             string detectionType = String(effect, "detectionType", "rangeOverlap");
             int detectionTicks = Mathf.Max(0, Int(effect, "detectionDurationTicks"));
             int activationTicks = Mathf.Clamp(Int(effect, "activationTick"), 0, detectionTicks);
@@ -157,9 +176,12 @@ namespace FrameAction
             float fixedRotation = snapshot.rotation;
             Vector3 anchorPosition = liveAnchor != null ? liveAnchor.position : fixedPosition;
             float anchorRotation = liveAnchor != null ? liveAnchor.eulerAngles.z : fixedRotation;
+            float triggerDelay = TicksToSeconds(Int(effect, "triggerDelayTicks"));
+            if (triggerDelay > 0f) yield return new WaitForSeconds(triggerDelay);
             if (detectionType == "physicalEntity")
             {
-                yield return RunPhysicalEntity(context, effect, worldAnchor ? fixedPosition : anchorPosition, worldAnchor ? fixedRotation : anchorRotation);
+                yield return RunPhysicalEntity(context, effect, worldAnchor ? fixedPosition : anchorPosition,
+                    worldAnchor ? fixedRotation : anchorRotation, releaseFacingSign);
                 yield break;
             }
             bool follow = !worldAnchor;
@@ -175,8 +197,10 @@ namespace FrameAction
             float elapsed = 0f;
             List<GameObject> companionObjects = new List<GameObject>();
             GameObject companionRoot = null;
+            float currentFacingSign = releaseFacingSign;
 
-            Vector2 initialCenter = ResolveDetectionVisualCenter(effect, follow ? anchorPosition : fixedPosition, follow ? anchorRotation : fixedRotation, 0f);
+            Vector2 initialCenter = ResolveDetectionVisualCenter(effect, follow ? anchorPosition : fixedPosition,
+                follow ? anchorRotation : fixedRotation, 0f, currentFacingSign);
             List<JObject> companionCues = Objects(effect["companionVfxEffects"]).ToList();
             if (companionCues.Count > 0)
             {
@@ -187,18 +211,20 @@ namespace FrameAction
                 foreach (JObject cue in companionCues) StartCoroutine(SpawnVfxAfterDelay(cue, initialCenter, null, companionObjects, false, companionRoot.transform, context.actionExecutionId));
             }
 
+            bool firstSample = true;
             do
             {
-                if (follow && liveAnchor != null && (!limitedFollow || elapsed <= followDuration))
+                if (!firstSample && follow && liveAnchor != null && (!limitedFollow || elapsed <= followDuration))
                 {
                     anchorPosition = liveAnchor.position;
                     anchorRotation = liveAnchor.eulerAngles.z;
+                    currentFacingSign = FacingSign;
                 }
                 Vector3 sourcePosition = follow ? anchorPosition : fixedPosition;
                 float sourceRotation = follow ? anchorRotation : fixedRotation;
                 if (companionRoot != null)
                 {
-                    companionRoot.transform.position = ResolveDetectionVisualCenter(effect, sourcePosition, sourceRotation, elapsed);
+                    companionRoot.transform.position = ResolveDetectionVisualCenter(effect, sourcePosition, sourceRotation, elapsed, currentFacingSign);
                     companionRoot.transform.rotation = Quaternion.Euler(0f, 0f, sourceRotation);
                 }
 
@@ -215,11 +241,12 @@ namespace FrameAction
                 if (active)
                 {
                     if (deduplication == "perDetection") hitIds.Clear();
-                    Detect(effect, sourcePosition, sourceRotation, elapsed, hitIds, context);
+                    Detect(effect, sourcePosition, sourceRotation, elapsed, currentFacingSign, hitIds, context);
                     if (detectionDuration <= 0f) oneShotExecuted = true;
                     previousActivationCycle = activationCycle;
                 }
                 if (windowDuration <= 0f || active && detectionDuration <= 0f) break;
+                firstSample = false;
                 elapsed += Time.deltaTime;
                 yield return null;
             }
@@ -237,7 +264,8 @@ namespace FrameAction
             }
         }
 
-        private IEnumerator RunPhysicalEntity(FrameActionEventContext context, JObject effect, Vector3 sourcePosition, float sourceRotation)
+        private IEnumerator RunPhysicalEntity(FrameActionEventContext context, JObject effect, Vector3 sourcePosition,
+            float sourceRotation, float facingSign)
         {
             int durationTicks = Mathf.Max(1, Int(effect, "detectionDurationTicks", 1));
             float duration = TicksToSeconds(durationTicks);
@@ -250,8 +278,8 @@ namespace FrameAction
             bool active = activationDelay <= 0f;
             int previousActivationCycle = -1;
 
-            Vector2 center = ResolveDetectionCenter(effect, sourcePosition, sourceRotation, 0f);
-            float rotation = sourceRotation + Float(effect, "rotation") * FacingSign;
+            Vector2 center = ResolveDetectionCenter(effect, sourcePosition, sourceRotation, 0f, facingSign);
+            float rotation = sourceRotation + Float(effect, "rotation") * facingSign;
             GameObject entity = FrameActionRuntimePool.Acquire(FrameActionPoolKind.PhysicalEntity, "FrameAction Physical Entity");
             entity.transform.position = new Vector3(center.x, center.y, 0f);
             entity.transform.rotation = Quaternion.Euler(0f, 0f, rotation);
@@ -305,16 +333,16 @@ namespace FrameAction
                 if (String(motion, "mode", "linear") == "bezier")
                 {
                     float pathDuration = TicksToSeconds(Mathf.Max(1, Int(motion, "durationTicks", 1)));
-                    carrier.ConfigurePath(seconds => ResolveDetectionCenter(effect, sourcePosition, sourceRotation, seconds), pathDuration);
+                    carrier.ConfigurePath(seconds => ResolveDetectionCenter(effect, sourcePosition, sourceRotation, seconds, facingSign), pathDuration);
                 }
                 else
                 {
-                    initialVelocity = (Vector2)(Quaternion.Euler(0f, 0f, sourceRotation) * EvaluateMotion(motion, 1f));
+                    initialVelocity = (Vector2)(Quaternion.Euler(0f, 0f, sourceRotation) * EvaluateMotion(motion, 1f, facingSign));
                 }
             }
             if (Bool(effect, "physicalInheritCasterVelocity") && ownerBody != null) initialVelocity += GetBodyVelocity(ownerBody);
             SetBodyVelocity(body, initialVelocity);
-            body.angularVelocity = Float(effect, "physicalInitialAngularVelocity") * FacingSign;
+            body.angularVelocity = Float(effect, "physicalInitialAngularVelocity") * facingSign;
             body.WakeUp();
             RegisterLiveObject(entity);
 
@@ -373,22 +401,22 @@ namespace FrameAction
             int mask = ResolveMask(String(effect, "hitLayerName", "Enemy"));
             if ((mask & (1 << targetCollider.gameObject.layer)) == 0) return;
             Transform hitTarget = ResolveHitTarget(targetCollider);
-            Transform owner = player != null ? player.transform : transform;
-            if (hitTarget == null || hitTarget == owner || hitTarget.IsChildOf(owner)) return;
+            if (hitTarget == null) return;
             if (!IsEligibleHurtbox(targetCollider, hitTarget)) return;
             int id = hitTarget.GetInstanceID();
             if (!hitIds.Add(id)) return;
             ApplyHit(effect, targetCollider, hitTarget, hitPoint, effectOrigin, context);
         }
 
-        private void Detect(JObject effect, Vector3 sourcePosition, float sourceRotation, float elapsed, HashSet<int> hitIds, FrameActionEventContext context)
+        private void Detect(JObject effect, Vector3 sourcePosition, float sourceRotation, float elapsed,
+            float facingSign, HashSet<int> hitIds, FrameActionEventContext context)
         {
             string detectionType = String(effect, "detectionType", "rangeOverlap");
             int mask = ResolveMask(String(effect, "hitLayerName", "Enemy"));
-            Vector2 center = ResolveDetectionCenter(effect, sourcePosition, sourceRotation, elapsed);
-            float rotation = ResolveDetectionRotation(effect, sourceRotation);
+            Vector2 center = ResolveDetectionCenter(effect, sourcePosition, sourceRotation, elapsed, facingSign);
+            float rotation = ResolveDetectionRotation(effect, sourceRotation, facingSign);
             Vector2 boxSize = new Vector2(Mathf.Max(0.01f, Float(effect, "boxWidth", 1f)), Mathf.Max(0.01f, Float(effect, "boxHeight", 1f)));
-            ApplyBoxGrowth(effect, elapsed, rotation, ref center, ref boxSize);
+            ApplyBoxGrowth(effect, elapsed, rotation, facingSign, ref center, ref boxSize);
             IEnumerable<Collider2D> colliders;
 
             if (detectionType == "raycast")
@@ -419,8 +447,7 @@ namespace FrameAction
             foreach (Collider2D targetCollider in colliders.Where(item => item != null).Distinct())
             {
                 Transform hitTarget = ResolveHitTarget(targetCollider);
-                Transform owner = player != null ? player.transform : transform;
-                if (hitTarget == null || hitTarget == owner || hitTarget.IsChildOf(owner)) continue;
+                if (hitTarget == null) continue;
                 if (!IsEligibleHurtbox(targetCollider, hitTarget)) continue;
                 int id = hitTarget.GetInstanceID();
                 if (!hitIds.Add(id)) continue;
@@ -447,8 +474,8 @@ namespace FrameAction
             IFrameActionDamageReceiver receiver = hitTarget.GetComponentsInParent<MonoBehaviour>(true).OfType<IFrameActionDamageReceiver>().FirstOrDefault();
             receiver?.ReceiveFrameActionDamage(new FrameActionDamageContext(
                 player,
-                Mathf.Max(0f, Float(effect, "damageMultiplier", 1f)),
-                Mathf.Max(0f, Float(effect, "fixedDamage", 0f)),
+                Float(effect, "damageMultiplier", 1f),
+                Float(effect, "fixedDamage", 0f),
                 hitPoint));
         }
 
@@ -486,6 +513,17 @@ namespace FrameAction
             if (type == "stun" || type == "superArmor" || type == "invincible")
             {
                 status?.ApplyFrameActionStatus(type, duration, player);
+                yield break;
+            }
+            if (type == "hover")
+            {
+                if (body == null) yield break;
+                FrameActionPhysicsMotion2D hoverMotion = body.GetComponent<FrameActionPhysicsMotion2D>();
+                if (hoverMotion == null) hoverMotion = body.gameObject.AddComponent<FrameActionPhysicsMotion2D>();
+                int hoverGeneration = hoverMotion.BeginHover(duration);
+                while (hoverMotion.IsHoverActiveFor(hoverGeneration) && (!untilActionEnd || !IsExecutionEnded(context.actionExecutionId)))
+                    yield return new WaitForFixedUpdate();
+                hoverMotion.CancelHover(hoverGeneration);
                 yield break;
             }
 
@@ -734,6 +772,15 @@ namespace FrameAction
             string configuredDestroyMode = String(effect, "destroyMode", configuredLoop ? "timed" : "natural");
             if (configuredLoop && configuredDestroyMode != "timed" && configuredDestroyMode != "onActionEnd") configuredDestroyMode = "timed";
             bool actionBound = ownedObjects == null && configuredLoop && configuredDestroyMode == "onActionEnd";
+            string anchorMode = String(effect, "anchor", "caster");
+            Transform anchor = ResolveAnchor(anchorMode, explicitTarget);
+            float releaseFacingSign = FacingSign;
+            Vector2 releaseAnchorPosition = anchorMode == "world" && explicitPosition.HasValue
+                ? explicitPosition.Value
+                : anchor != null ? (Vector2)anchor.position : explicitPosition ?? (Vector2)transform.position;
+            float releaseAnchorRotation = parentLocalSpace && ownedParent != null
+                ? ownedParent.eulerAngles.z
+                : anchor != null ? anchor.eulerAngles.z : 0f;
             float delay = TicksToSeconds(Int(effect, "triggerDelayTicks"));
             if (delay > 0f) yield return new WaitForSeconds(delay);
             if (actionBound && IsExecutionEnded(actionExecutionId)) yield break;
@@ -745,36 +792,42 @@ namespace FrameAction
             if (renderer == null) renderer = instance.AddComponent<SpriteRenderer>();
             renderer.sprite = sprite;
             renderer.sortingLayerName = vfxSortingLayer;
-            renderer.sortingOrder = vfxSortingOrder;
-            string anchorMode = String(effect, "anchor", "caster");
-            Transform anchor = ResolveAnchor(anchorMode, explicitTarget);
+            renderer.sortingOrder = String(effect, "renderLayer", "front") == "back" ? vfxBackSortingOrder : vfxSortingOrder;
             float scale = Mathf.Max(0.01f, Float(effect, "scale", 1f));
             float desiredPixelsPerUnit = Mathf.Max(1f, Float(effect, "pixelsPerUnit", sprite.pixelsPerUnit));
             float visualScale = scale * Mathf.Max(0.0001f, sprite.pixelsPerUnit) / desiredPixelsPerUnit;
-            float rotation = Float(effect, "rotation") * FacingSign;
             float pivotX = Mathf.Clamp01(Float(effect, "pivotX", 0.5f));
             float pivotY = Mathf.Clamp01(Float(effect, "pivotY", 0.5f));
-            Vector2 pivotOffset = new Vector2(
-                (0.5f - pivotX) * sprite.rect.width / desiredPixelsPerUnit * scale * FacingSign,
-                (0.5f - pivotY) * sprite.rect.height / desiredPixelsPerUnit * scale);
-            pivotOffset = Quaternion.Euler(0f, 0f, rotation) * pivotOffset;
-            Vector2 localVisualOffset = new Vector2(Float(effect, "x") * FacingSign, Float(effect, "y")) + pivotOffset;
+            VfxVisualSettings visual = new VfxVisualSettings(
+                new Vector2(Float(effect, "x"), Float(effect, "y")),
+                new Vector2(
+                    (0.5f - pivotX) * sprite.rect.width / desiredPixelsPerUnit * scale,
+                    (0.5f - pivotY) * sprite.rect.height / desiredPixelsPerUnit * scale),
+                Float(effect, "rotation"),
+                visualScale);
+            Vector2 localVisualOffset = ResolveVfxLocalOffset(visual, releaseFacingSign);
+            float localVisualRotation = ResolveVfxLocalRotation(visual, releaseFacingSign);
+            Vector3 localVisualScale = ResolveVfxLocalScale(visual, releaseFacingSign);
+            Vector2 anchorPosition = anchorMode != "world" && anchor != null
+                ? (Vector2)anchor.position
+                : releaseAnchorPosition;
+            float anchorRotation = parentLocalSpace && ownedParent != null
+                ? ownedParent.eulerAngles.z
+                : anchorMode != "world" && anchor != null ? anchor.eulerAngles.z : releaseAnchorRotation;
+            Quaternion anchorBasis = Quaternion.Euler(0f, 0f, anchorRotation);
             if (parentLocalSpace && ownedParent != null)
             {
                 instance.transform.SetParent(ownedParent, false);
                 instance.transform.localPosition = new Vector3(localVisualOffset.x, localVisualOffset.y, 0f);
-                instance.transform.localRotation = Quaternion.Euler(0f, 0f, rotation);
-                instance.transform.localScale = new Vector3(visualScale * FacingSign, visualScale, visualScale);
+                instance.transform.localRotation = Quaternion.Euler(0f, 0f, localVisualRotation);
+                instance.transform.localScale = localVisualScale;
             }
             else
             {
-                Vector2 position = anchorMode == "world" && explicitPosition.HasValue
-                    ? explicitPosition.Value
-                    : anchor != null ? (Vector2)anchor.position : explicitPosition ?? (Vector2)transform.position;
-                position += localVisualOffset;
+                Vector2 position = anchorPosition + (Vector2)(anchorBasis * localVisualOffset);
                 instance.transform.position = new Vector3(position.x, position.y, 0f);
-                instance.transform.rotation = Quaternion.Euler(0f, 0f, rotation);
-                instance.transform.localScale = new Vector3(visualScale * FacingSign, visualScale, visualScale);
+                instance.transform.rotation = Quaternion.Euler(0f, 0f, anchorRotation + localVisualRotation);
+                instance.transform.localScale = localVisualScale;
                 if (ownedParent != null) instance.transform.SetParent(ownedParent, true);
             }
             bool loop = configuredLoop;
@@ -789,7 +842,9 @@ namespace FrameAction
             float followDuration = limitedFollow ? TicksToSeconds(Int(effect, "followDurationTicks")) : float.PositiveInfinity;
             if (followsAnchor || motion != null && Bool(motion, "enabled"))
             {
-                StartCoroutine(AnimateVfx(instance, poolGeneration, motion, followsAnchor ? anchor : null, followDuration, player != null ? player.transform : transform, localVisualOffset));
+                Transform retargetTransform = followsAnchor ? player != null ? player.transform : transform : null;
+                StartCoroutine(AnimateVfx(instance, poolGeneration, motion, followsAnchor ? anchor : null, followDuration,
+                    retargetTransform, visual, releaseFacingSign, anchorPosition, anchorRotation, anchorMode == "caster"));
             }
 
             string destroyMode = configuredDestroyMode;
@@ -821,13 +876,15 @@ namespace FrameAction
             }
         }
 
-        private IEnumerator AnimateVfx(GameObject instance, int generation, JObject motion, Transform anchor, float followDuration, Transform retargetTransform, Vector2 retargetLocalOffset)
+        private IEnumerator AnimateVfx(GameObject instance, int generation, JObject motion, Transform anchor, float followDuration,
+            Transform retargetTransform, VfxVisualSettings visual, float releaseFacingSign, Vector2 releaseAnchorPosition,
+            float releaseAnchorRotation, bool followCasterFacing)
         {
             Transform target = instance != null ? instance.transform : null;
             if (target == null) yield break;
-            Vector3 start = target.position;
-            Vector3 anchorStart = anchor != null ? anchor.position : Vector3.zero;
-            Vector3 anchorDelta = Vector3.zero;
+            Vector2 fixedAnchorPosition = releaseAnchorPosition;
+            float fixedAnchorRotation = releaseAnchorRotation;
+            float fixedFacingSign = releaseFacingSign;
             float elapsed = 0f;
             bool motionEnabled = motion != null && Bool(motion, "enabled");
             bool bezier = motionEnabled && String(motion, "mode", "linear") == "bezier";
@@ -835,15 +892,34 @@ namespace FrameAction
             while (target != null && IsCurrentPoolLease(instance, generation))
             {
                 bool following = anchor != null && (float.IsPositiveInfinity(followDuration) || elapsed <= followDuration);
-                if (following) anchorDelta = anchor.position - anchorStart;
+                if (following)
+                {
+                    fixedAnchorPosition = anchor.position;
+                    fixedAnchorRotation = anchor.eulerAngles.z;
+                    if (followCasterFacing) fixedFacingSign = FacingSign;
+                }
 
-                Vector2 motionOffset = motionEnabled ? EvaluateMotion(motion, elapsed) : Vector2.zero;
+                Quaternion basisRotation = Quaternion.Euler(0f, 0f, fixedAnchorRotation);
+                Vector2 visualOrigin = fixedAnchorPosition
+                    + (Vector2)(basisRotation * ResolveVfxLocalOffset(visual, fixedFacingSign));
+                Vector2 motionOffset = motionEnabled ? EvaluateMotion(motion, elapsed, fixedFacingSign) : Vector2.zero;
                 Vector2 retargetPosition = Vector2.zero;
-                Vector2 recoveryPoint = retargetTransform != null
-                    ? (Vector2)retargetTransform.TransformPoint(new Vector3(retargetLocalOffset.x, retargetLocalOffset.y, 0f))
-                    : (Vector2)(start + anchorDelta);
-                bool retargeted = motionEnabled && TryEvaluateRetargetedWorldPosition(motion, start + anchorDelta, Quaternion.identity, recoveryPoint, elapsed, out retargetPosition);
-                target.position = retargeted ? (Vector3)retargetPosition : start + anchorDelta + (Vector3)motionOffset;
+                Vector2 recoveryPoint = visualOrigin;
+                if (retargetTransform != null)
+                {
+                    float recoveryFacingSign = followCasterFacing ? FacingSign : fixedFacingSign;
+                    Quaternion recoveryRotation = Quaternion.Euler(0f, 0f, retargetTransform.eulerAngles.z);
+                    recoveryPoint = (Vector2)retargetTransform.position
+                        + (Vector2)(recoveryRotation * ResolveVfxLocalOffset(visual, recoveryFacingSign));
+                }
+                bool retargeted = motionEnabled && TryEvaluateRetargetedWorldPosition(
+                    motion, visualOrigin, basisRotation, recoveryPoint, elapsed, fixedFacingSign, out retargetPosition);
+                target.position = retargeted
+                    ? (Vector3)retargetPosition
+                    : visualOrigin + (Vector2)(basisRotation * motionOffset);
+                target.rotation = Quaternion.Euler(0f, 0f,
+                    fixedAnchorRotation + ResolveVfxLocalRotation(visual, fixedFacingSign));
+                target.localScale = ResolveVfxLocalScale(visual, fixedFacingSign);
 
                 bool followActive = anchor != null && (float.IsPositiveInfinity(followDuration) || elapsed < followDuration);
                 bool motionActive = motionEnabled && (!bezier || elapsed < motionDuration);
@@ -866,17 +942,21 @@ namespace FrameAction
             string configuredDestroyMode = String(effect, "destroyMode", configuredLoop ? "timed" : "natural");
             if (configuredLoop && configuredDestroyMode != "timed" && configuredDestroyMode != "onActionEnd") configuredDestroyMode = "timed";
             bool actionBound = configuredLoop && configuredDestroyMode == "onActionEnd";
+            string anchorMode = String(effect, "anchor", "caster");
+            Transform anchor = ResolveAnchor(anchorMode, explicitTarget);
+            float releaseFacingSign = FacingSign;
+            Vector2 releaseAnchorPosition = anchorMode == "world" && explicitPosition.HasValue
+                ? explicitPosition.Value
+                : anchor != null ? (Vector2)anchor.position : explicitPosition ?? (Vector2)transform.position;
             float delay = TicksToSeconds(Int(effect, "triggerDelayTicks"));
             if (delay > 0f) yield return new WaitForSeconds(delay);
             if (actionBound && IsExecutionEnded(actionExecutionId)) yield break;
             AudioClip clip = player?.characterAsset?.FindAsset<AudioClip>(String(effect, "assetId"));
             if (clip == null) yield break;
-            string anchorMode = String(effect, "anchor", "caster");
-            Transform anchor = ResolveAnchor(anchorMode, explicitTarget);
-            Vector2 position = anchorMode == "world" && explicitPosition.HasValue
-                ? explicitPosition.Value
-                : anchor != null ? (Vector2)anchor.position : explicitPosition ?? (Vector2)transform.position;
-            position += new Vector2(Float(effect, "x") * FacingSign, Float(effect, "y"));
+            Vector2 position = anchorMode != "world" && anchor != null
+                ? (Vector2)anchor.position
+                : releaseAnchorPosition;
+            position += new Vector2(Float(effect, "x") * releaseFacingSign, Float(effect, "y"));
             GameObject instance = FrameActionRuntimePool.Acquire(FrameActionPoolKind.Sfx, $"FrameAction SFX {clip.name}");
             instance.transform.position = new Vector3(position.x, position.y, 0f);
             if (anchorMode != "world" && anchor != null) instance.transform.SetParent(anchor, true);
@@ -908,13 +988,13 @@ namespace FrameAction
             if (version == _hitStopVersion) RestoreHitStop();
         }
 
-        private Vector2 ResolveDetectionCenter(JObject effect, Vector3 sourcePosition, float sourceRotation, float elapsed)
+        private Vector2 ResolveDetectionCenter(JObject effect, Vector3 sourcePosition, float sourceRotation, float elapsed, float facingSign)
         {
             string detectionType = String(effect, "detectionType", "rangeOverlap");
             Vector2 local = detectionType == "raycast"
                 ? new Vector2(Float(effect, "rayOriginX"), Float(effect, "rayOriginY"))
                 : new Vector2(Float(effect, "centerX"), Float(effect, "centerY"));
-            local.x *= FacingSign;
+            local.x *= facingSign;
             Quaternion basisRotation = Quaternion.Euler(0f, 0f, sourceRotation);
             Vector2 origin = (Vector2)sourcePosition + (Vector2)(basisRotation * local);
             JObject motion = effect["motion"] as JObject;
@@ -922,19 +1002,19 @@ namespace FrameAction
             Quaternion recoveryRotation = Quaternion.Euler(0f, 0f, recoveryTransform.eulerAngles.z);
             Vector2 recoveryPoint = (Vector2)recoveryTransform.position + (Vector2)(recoveryRotation * local);
             Vector2 retargeted;
-            if (TryEvaluateRetargetedWorldPosition(motion, origin, basisRotation, recoveryPoint, elapsed, out retargeted)) return retargeted;
-            return origin + (Vector2)(basisRotation * EvaluateMotion(motion, elapsed));
+            if (TryEvaluateRetargetedWorldPosition(motion, origin, basisRotation, recoveryPoint, elapsed, facingSign, out retargeted)) return retargeted;
+            return origin + (Vector2)(basisRotation * EvaluateMotion(motion, elapsed, facingSign));
         }
 
-        private Vector2 ResolveDetectionVisualCenter(JObject effect, Vector3 sourcePosition, float sourceRotation, float elapsed)
+        private Vector2 ResolveDetectionVisualCenter(JObject effect, Vector3 sourcePosition, float sourceRotation, float elapsed, float facingSign)
         {
-            Vector2 center = ResolveDetectionCenter(effect, sourcePosition, sourceRotation, elapsed);
+            Vector2 center = ResolveDetectionCenter(effect, sourcePosition, sourceRotation, elapsed, facingSign);
             Vector2 size = new Vector2(Mathf.Max(0.01f, Float(effect, "boxWidth", 1f)), Mathf.Max(0.01f, Float(effect, "boxHeight", 1f)));
-            ApplyBoxGrowth(effect, elapsed, ResolveDetectionRotation(effect, sourceRotation), ref center, ref size);
+            ApplyBoxGrowth(effect, elapsed, ResolveDetectionRotation(effect, sourceRotation, facingSign), facingSign, ref center, ref size);
             return center;
         }
 
-        private void ApplyBoxGrowth(JObject effect, float elapsed, float rotation, ref Vector2 center, ref Vector2 size)
+        private void ApplyBoxGrowth(JObject effect, float elapsed, float rotation, float facingSign, ref Vector2 center, ref Vector2 size)
         {
             if (!Bool(effect, "boxGrowthEnabled")
                 || String(effect, "detectionType", "rangeOverlap") != "rangeOverlap"
@@ -955,43 +1035,44 @@ namespace FrameAction
                     size.y += extension;
                     break;
                 case "left":
-                    localDirection = Vector2.left * FacingSign;
+                    localDirection = Vector2.left * facingSign;
                     size.x += extension;
                     break;
                 default:
-                    localDirection = Vector2.right * FacingSign;
+                    localDirection = Vector2.right * facingSign;
                     size.x += extension;
                     break;
             }
             center += (Vector2)(Quaternion.Euler(0f, 0f, rotation) * localDirection) * (extension * 0.5f);
         }
 
-        private float ResolveDetectionRotation(JObject effect, float sourceRotation)
+        private float ResolveDetectionRotation(JObject effect, float sourceRotation, float facingSign)
         {
             float localRotation = Float(effect, "rotation");
             bool directional = String(effect, "detectionType", "rangeOverlap") == "raycast"
                 || String(effect, "shape", "box") == "sector";
-            if (directional && FacingSign < 0f) localRotation = 180f - localRotation;
-            else localRotation *= FacingSign;
+            if (directional && facingSign < 0f) localRotation = 180f - localRotation;
+            else localRotation *= facingSign;
             return sourceRotation + localRotation;
         }
 
-        private Vector2 EvaluateMotion(JObject motion, float elapsed)
+        private Vector2 EvaluateMotion(JObject motion, float elapsed, float facingSign)
         {
             if (motion == null || !Bool(motion, "enabled")) return Vector2.zero;
             if (String(motion, "mode", "linear") == "bezier")
             {
                 float duration = TicksToSeconds(Mathf.Max(1, Int(motion, "durationTicks", 1)));
                 return CubicBezier(Vector2.zero,
-                    new Vector2(Float(motion, "controlAX") * FacingSign, Float(motion, "controlAY")),
-                    new Vector2(Float(motion, "controlBX") * FacingSign, Float(motion, "controlBY")),
-                    new Vector2(Float(motion, "endX") * FacingSign, Float(motion, "endY")), EvaluateProgressCurve(motion["pathProgressCurve"], elapsed / duration));
+                    new Vector2(Float(motion, "controlAX") * facingSign, Float(motion, "controlAY")),
+                    new Vector2(Float(motion, "controlBX") * facingSign, Float(motion, "controlBY")),
+                    new Vector2(Float(motion, "endX") * facingSign, Float(motion, "endY")), EvaluateProgressCurve(motion["pathProgressCurve"], elapsed / duration));
             }
-            Vector2 direction = new Vector2(Float(motion, "directionX", 1f) * FacingSign, Float(motion, "directionY")).normalized;
+            Vector2 direction = new Vector2(Float(motion, "directionX", 1f) * facingSign, Float(motion, "directionY")).normalized;
             return direction * Float(motion, "speed") * elapsed;
         }
 
-        private bool TryEvaluateRetargetedWorldPosition(JObject motion, Vector2 origin, Quaternion basisRotation, Vector2 recoveryPoint, float elapsed, out Vector2 worldPosition)
+        private bool TryEvaluateRetargetedWorldPosition(JObject motion, Vector2 origin, Quaternion basisRotation,
+            Vector2 recoveryPoint, float elapsed, float facingSign, out Vector2 worldPosition)
         {
             worldPosition = origin;
             if (motion == null || !Bool(motion, "enabled") || String(motion, "mode", "linear") != "bezier" || !Bool(motion, "retargetOnDescendingPath")) return false;
@@ -1001,12 +1082,30 @@ namespace FrameAction
             float maxProgress = EvaluateMaxProgressUntil(motion["pathProgressCurve"], normalizedTime);
             if (maxProgress <= 0.0001f || progress >= maxProgress - 0.0001f) return false;
             Vector2 farthest = origin + (Vector2)(basisRotation * CubicBezier(Vector2.zero,
-                new Vector2(Float(motion, "controlAX") * FacingSign, Float(motion, "controlAY")),
-                new Vector2(Float(motion, "controlBX") * FacingSign, Float(motion, "controlBY")),
-                new Vector2(Float(motion, "endX") * FacingSign, Float(motion, "endY")), maxProgress));
+                new Vector2(Float(motion, "controlAX") * facingSign, Float(motion, "controlAY")),
+                new Vector2(Float(motion, "controlBX") * facingSign, Float(motion, "controlBY")),
+                new Vector2(Float(motion, "endX") * facingSign, Float(motion, "endY")), maxProgress));
             float returnLerp = Mathf.Clamp01(1f - progress / maxProgress);
             worldPosition = Vector2.Lerp(farthest, recoveryPoint, returnLerp);
             return true;
+        }
+
+        private static Vector2 ResolveVfxLocalOffset(VfxVisualSettings visual, float facingSign)
+        {
+            float rotation = ResolveVfxLocalRotation(visual, facingSign);
+            Vector2 pivotOffset = new Vector2(visual.pivotOffset.x * facingSign, visual.pivotOffset.y);
+            pivotOffset = Quaternion.Euler(0f, 0f, rotation) * pivotOffset;
+            return new Vector2(visual.offset.x * facingSign, visual.offset.y) + pivotOffset;
+        }
+
+        private static float ResolveVfxLocalRotation(VfxVisualSettings visual, float facingSign)
+        {
+            return visual.rotation * facingSign;
+        }
+
+        private static Vector3 ResolveVfxLocalScale(VfxVisualSettings visual, float facingSign)
+        {
+            return new Vector3(visual.scale * facingSign, visual.scale, visual.scale);
         }
 
         private void ApplyCamera(FrameActionEventContext context)
@@ -1131,8 +1230,7 @@ namespace FrameAction
 
         private int ResolveMask(string layerName)
         {
-            int mask = string.IsNullOrEmpty(layerName) ? 0 : LayerMask.GetMask(layerName);
-            return mask != 0 ? mask : defaultTargetLayers.value;
+            return string.IsNullOrWhiteSpace(layerName) ? 0 : LayerMask.GetMask(layerName);
         }
 
         private PhysicsMaterial2D ResolvePhysicalMaterial(JObject effect)

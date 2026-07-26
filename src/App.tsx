@@ -87,6 +87,7 @@ interface EditorLayout {
 }
 
 const DEFAULT_EDITOR_LAYOUT: EditorLayout = { leftPanelWidth: 248, rightPanelWidth: 340, timelineHeight: 294 };
+const ACTOR_ASSET_BASE64_CHUNK_SIZE = 8 * 1024 * 1024;
 
 function clampLayoutValue(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
@@ -145,6 +146,45 @@ function naturalCompare(a: File, b: File): number {
 function unityProjectName(projectPath: string): string {
   const normalized = projectPath.trim().replace(/[\\/]+$/, "");
   return normalized.split(/[\\/]/).pop() || normalized || "Unity 项目";
+}
+
+function inspectBase64DataUrl(value: string): { base64Start: number; base64Length: number; byteSize: number } {
+  const separator = value.indexOf(",");
+  if (separator < 0 || !value.slice(0, separator).toLowerCase().includes(";base64")) throw new Error("角色资源不是有效的 Base64 Data URL");
+  const base64Start = separator + 1;
+  const base64Length = value.length - base64Start;
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  const byteSize = Math.floor(base64Length * 3 / 4) - padding;
+  if (byteSize <= 0) throw new Error("角色资源内容为空");
+  return { base64Start, base64Length, byteSize };
+}
+
+function decodeBase64Chunk(value: string): Uint8Array<ArrayBuffer> {
+  const binary = window.atob(value);
+  const bytes = new Uint8Array(new ArrayBuffer(binary.length));
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+function isSha256(value: string | undefined): value is string {
+  return /^[a-f0-9]{64}$/i.test(value || "");
+}
+
+async function sha256Base64DataUrl(
+  value: string,
+  info: ReturnType<typeof inspectBase64DataUrl>,
+): Promise<string> {
+  const bytes = new Uint8Array(new ArrayBuffer(info.byteSize));
+  let writtenBytes = 0;
+  for (let offset = 0; offset < info.base64Length; offset += ACTOR_ASSET_BASE64_CHUNK_SIZE) {
+    const end = Math.min(info.base64Length, offset + ACTOR_ASSET_BASE64_CHUNK_SIZE);
+    const chunk = decodeBase64Chunk(value.slice(info.base64Start + offset, info.base64Start + end));
+    bytes.set(chunk, writtenBytes);
+    writtenBytes += chunk.byteLength;
+  }
+  if (writtenBytes !== info.byteSize) throw new Error("角色资源大小校验失败");
+  const digest = new Uint8Array(await window.crypto.subtle.digest("SHA-256", bytes.buffer));
+  return Array.from(digest, (item) => item.toString(16).padStart(2, "0")).join("");
 }
 
 function getSheetLayout(value: SheetDialogState) {
@@ -268,6 +308,7 @@ function normalizeVfxEffect(effect: Record<string, any>, allowTarget: boolean, d
   effect.pixelsPerUnit = Math.max(1, Number(effect.pixelsPerUnit) || defaultPixelsPerUnit);
   effect.pivotX = Math.min(1, Math.max(0, Number.isFinite(Number(effect.pivotX)) ? Number(effect.pivotX) : 0.5));
   effect.pivotY = Math.min(1, Math.max(0, Number.isFinite(Number(effect.pivotY)) ? Number(effect.pivotY) : 0.5));
+  effect.renderLayer = effect.renderLayer === "back" ? "back" : "front";
   effect.motion ||= inactiveMotion();
   effect.motion.pathProgressCurve = normalizeProgressCurve(effect.motion.pathProgressCurve);
   if (companion) {
@@ -281,6 +322,7 @@ function normalizeVfxEffect(effect: Record<string, any>, allowTarget: boolean, d
     effect.durationTicks = 0;
     return;
   }
+  effect.triggerDelayTicks = Math.max(0, Math.round(Number(effect.triggerDelayTicks) || 0));
   effect.loop = forceOneShot ? false : Boolean(effect.loop);
   if (!effect.loop) {
     effect.destroyMode = "natural";
@@ -297,7 +339,6 @@ function normalizeVfxEffect(effect: Record<string, any>, allowTarget: boolean, d
   } else {
     effect.motion = inactiveMotion();
   }
-  if (!forceOneShot) effect.triggerDelayTicks = 0;
 }
 
 function normalizeSfxEffect(effect: Record<string, any>, allowTarget: boolean) {
@@ -311,7 +352,7 @@ function normalizeSfxEffect(effect: Record<string, any>, allowTarget: boolean) {
     effect.destroyMode = "timed";
     effect.durationTicks = Math.max(1, Number(effect.durationTicks) || 180);
   }
-  if (!allowTarget) effect.triggerDelayTicks = 0;
+  effect.triggerDelayTicks = Math.max(0, Math.round(Number(effect.triggerDelayTicks) || 0));
 }
 
 function inferCharacterEntries(project: CharacterProject) {
@@ -347,7 +388,7 @@ function cleanLegacyProjectData(value: CharacterProject): CharacterProject {
     const jumpIndex = jumpAction ? project.actions.indexOf(jumpAction) : project.actions.length - 1;
     project.actions.splice(jumpIndex + 1, 0, dropThrough);
   }
-  project.version = 6;
+  project.version = 11;
   const defaultMotor = createMotorSettings();
   const legacyMotor = (project.motor || {}) as CharacterProject["motor"] & { walkSpeed?: number; runSpeed?: number; jumpHeight?: number };
   const legacyWalkSpeed = Math.max(0, Number(legacyMotor.walkSpeed) || 4);
@@ -379,9 +420,11 @@ function cleanLegacyProjectData(value: CharacterProject): CharacterProject {
   project.cameraFollow.constrainToMap = project.cameraFollow.constrainToMap !== false;
   project.cameraFollow.edgePaddingX = Math.max(0, Number(project.cameraFollow.edgePaddingX) || 0);
   project.cameraFollow.edgePaddingY = Math.max(0, Number(project.cameraFollow.edgePaddingY) || 0);
-  const defaultUnityCharacter = createUnityCharacterSettings();
+  const defaultActorLayerName = project.projectKind === "enemy" ? "Enemy" : "Player";
+  const defaultUnityCharacter = createUnityCharacterSettings(defaultActorLayerName);
   project.unityCharacter = { ...defaultUnityCharacter, ...(project.unityCharacter || {}) };
   project.unityCharacter.prefabPath = String(project.unityCharacter.prefabPath || "").trim().replace(/\\/g, "/");
+  project.unityCharacter.actorLayerName = String(project.unityCharacter.actorLayerName || defaultActorLayerName).trim() || defaultActorLayerName;
   project.unityCharacter.collideWithOtherActors = project.unityCharacter.collideWithOtherActors === true;
   project.unityCharacter.colliderShape = project.unityCharacter.colliderShape === "box" ? "box" : "capsule";
   project.unityCharacter.colliderWidth = Math.max(0.01, Number(project.unityCharacter.colliderWidth) || defaultUnityCharacter.colliderWidth);
@@ -458,6 +501,8 @@ function cleanLegacyProjectData(value: CharacterProject): CharacterProject {
   }
   for (const action of project.actions) {
     delete (action as CharacterAction & Record<string, unknown>).transform;
+    action.acceptMovementInput = typeof action.acceptMovementInput === "boolean" ? action.acceptMovementInput : action.type !== "attack";
+    action.acceptJumpInput = typeof action.acceptJumpInput === "boolean" ? action.acceptJumpInput : false;
     action.transitions ||= {};
     action.trigger ||= { type: "none", code: "" };
     if (project.projectKind === "enemy") {
@@ -1430,7 +1475,7 @@ export default function App() {
     const vfxAssetIds = collectVfxAssetIds(replacerProject);
     const editorAssets = Object.values(assets)
       .filter((asset) => asset.dataUrl && referencedAssets.has(asset.id))
-      .map(({ id, name, kind, usage, dataUrl, width, height, durationSeconds }) => ({ id, name, kind, usage: usage || (kind === "audio" ? "audio" : vfxAssetIds.has(id) ? "vfx" : "character"), dataUrl, width, height, durationSeconds }));
+      .map(({ id, name, kind, usage, dataUrl, byteSize, sha256, width, height, durationSeconds }) => ({ id, name, kind, usage: usage || (kind === "audio" ? "audio" : vfxAssetIds.has(id) ? "vfx" : "character"), dataUrl, byteSize, sha256, width, height, durationSeconds }));
     const blob = new Blob([JSON.stringify({ ...replacerProject, editorAssets }, null, 2)], { type: "application/json" });
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
@@ -1676,18 +1721,117 @@ export default function App() {
     const vfxAssetIds = collectVfxAssetIds(syncProject);
     const syncAssets = Object.values(assets)
       .filter((asset) => asset.dataUrl && referencedAssets.has(asset.id))
-      .map((asset) => ({ id: asset.id, name: asset.name, kind: asset.kind, usage: asset.usage || (asset.kind === "audio" ? "audio" : vfxAssetIds.has(asset.id) ? "vfx" : "character"), dataUrl: asset.dataUrl }));
-    const result = await postJson<{
+      .map((asset) => ({ id: asset.id, name: asset.name, kind: asset.kind, usage: asset.usage || (asset.kind === "audio" ? "audio" : vfxAssetIds.has(asset.id) ? "vfx" : "character"), dataUrl: asset.dataUrl! }));
+    const preparedAssets: Array<{
+      asset: (typeof syncAssets)[number];
+      base64Start: number;
+      base64Length: number;
+      byteSize: number;
+      sha256: string;
+    }> = [];
+    const hashUpdates = new Map<string, { byteSize: number; sha256: string }>();
+    for (let assetIndex = 0; assetIndex < syncAssets.length; assetIndex += 1) {
+      const asset = syncAssets[assetIndex];
+      const info = inspectBase64DataUrl(asset.dataUrl);
+      const cachedAsset = assets[asset.id];
+      const sha256 = isSha256(cachedAsset?.sha256) && cachedAsset.byteSize === info.byteSize
+        ? cachedAsset.sha256.toLowerCase()
+        : await sha256Base64DataUrl(asset.dataUrl, info);
+      preparedAssets.push({ asset, ...info, sha256 });
+      if (cachedAsset?.sha256 !== sha256 || cachedAsset.byteSize !== info.byteSize) {
+        hashUpdates.set(asset.id, { byteSize: info.byteSize, sha256 });
+      }
+      if ((assetIndex + 1) % 20 === 0 || assetIndex + 1 === syncAssets.length) {
+        setSyncDialog((current) => current ? {
+          ...current,
+          phase: "syncing",
+          message: `正在检查${actorLabel}资源变化...\n${assetIndex + 1}/${syncAssets.length}`,
+        } : current);
+      }
+    }
+    if (hashUpdates.size) {
+      setAssets((current) => Object.fromEntries(Object.entries(current).map(([id, asset]) => {
+        const hash = hashUpdates.get(id);
+        return [id, hash ? { ...asset, ...hash } : asset];
+      })));
+    }
+    const startResult = await postJson<{
       ok: true;
-      runtime: { version: string };
-      result: { changedFiles: number; assetCount: number; actionCount: number; jsonPath: string; prefabPath: string; prefabPathAdjustedFrom?: string };
-    }>(isEnemy ? "/api/unity/sync-enemy" : "/api/unity/sync", {
+      result: {
+        uploadId: string;
+        assetCount: number;
+        uploadAssetIds: string[];
+        uploadAssetCount: number;
+        reusedAssetCount: number;
+      };
+    }>("/api/unity/actor-sync/start", {
       projectPath,
+      actorKind,
       project: syncProject,
-      assets: syncAssets,
+      assets: preparedAssets.map(({ asset, byteSize, sha256 }) => ({ id: asset.id, name: asset.name, kind: asset.kind, usage: asset.usage, byteSize, sha256 })),
       confirmOverwrite,
       targetJsonPath: editingUnityActorPath,
     });
+    const uploadId = startResult.result.uploadId;
+    const requestedUploadIds = Array.isArray(startResult.result.uploadAssetIds)
+      ? startResult.result.uploadAssetIds
+      : preparedAssets.map(({ asset }) => asset.id);
+    const uploadAssetIds = new Set(requestedUploadIds);
+    const uploadAssets = preparedAssets.filter(({ asset }) => uploadAssetIds.has(asset.id));
+    const totalBytes = uploadAssets.reduce((sum, item) => sum + item.byteSize, 0);
+    let completedBytes = 0;
+    let result: {
+      ok: true;
+      runtime: { version: string };
+      result: {
+        changedFiles: number;
+        assetCount: number;
+        actionCount: number;
+        uploadedAssetCount: number;
+        reusedAssetCount: number;
+        jsonPath: string;
+        prefabPath: string;
+        prefabPathAdjustedFrom?: string;
+      };
+    };
+    try {
+      for (let assetIndex = 0; assetIndex < uploadAssets.length; assetIndex += 1) {
+        const { asset, base64Start, base64Length, byteSize } = uploadAssets[assetIndex];
+        let uploadedBytes = 0;
+        for (let offset = 0; offset < base64Length; offset += ACTOR_ASSET_BASE64_CHUNK_SIZE) {
+          const chunk = decodeBase64Chunk(asset.dataUrl.slice(base64Start + offset, base64Start + Math.min(base64Length, offset + ACTOR_ASSET_BASE64_CHUNK_SIZE)));
+          const chunkResponse = await fetch("/api/unity/actor-sync/chunk", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/octet-stream",
+              "X-Frame-Action-Upload-Id": uploadId,
+              "X-Frame-Action-Asset-Id": encodeURIComponent(asset.id),
+              "X-Frame-Action-Upload-Offset": String(uploadedBytes),
+            },
+            body: chunk.buffer,
+          });
+          const chunkResult = await chunkResponse.json();
+          if (!chunkResponse.ok || chunkResult.ok === false) throw new Error(chunkResult.message || `资源分块上传失败：${asset.name}`);
+          uploadedBytes = Number(chunkResult.result.receivedBytes) || uploadedBytes + chunk.byteLength;
+          const progress = Math.round(((completedBytes + uploadedBytes) / Math.max(1, totalBytes)) * 100);
+          setSyncDialog((current) => current ? {
+            ...current,
+            phase: "syncing",
+            message: `正在上传${actorLabel}资源 ${Math.min(100, progress)}%\n${assetIndex + 1}/${uploadAssets.length} · ${asset.name}`,
+          } : current);
+        }
+        completedBytes += byteSize;
+      }
+      setSyncDialog((current) => current ? { ...current, phase: "syncing", message: `正在写入${actorLabel}动作数据和资源清单...` } : current);
+      result = await postJson("/api/unity/actor-sync/finish", { uploadId });
+    } catch (error) {
+      void postJson("/api/unity/actor-sync/cancel", { uploadId }).catch(() => undefined);
+      throw error;
+    }
+    const uploadedAssetCount = Number.isFinite(result.result.uploadedAssetCount) ? result.result.uploadedAssetCount : uploadAssets.length;
+    const reusedAssetCount = Number.isFinite(result.result.reusedAssetCount)
+      ? result.result.reusedAssetCount
+      : Math.max(0, result.result.assetCount - uploadedAssetCount);
     if (result.result.prefabPathAdjustedFrom) {
       mutateProject((draft) => { draft.unityCharacter.prefabPath = result.result.prefabPath; }, "unity-prefab-auto-isolate");
     }
@@ -1697,7 +1841,7 @@ export default function App() {
     setSelectedUnityCharacterPath(result.result.jsonPath);
     setEditingUnityActorPath(result.result.jsonPath);
     void refreshUnityCharacters(projectPath);
-    setStatus(`Unity 同步完成 · 更新 ${result.result.changedFiles} 个文件`);
+    setStatus(`Unity 同步完成 · 更新 ${result.result.changedFiles} 个文件 · 上传 ${uploadedAssetCount} 个资源`);
     setSyncDialog({
       path: projectPath,
       phase: "done",
@@ -1705,6 +1849,7 @@ export default function App() {
       runtimeVersion: result.runtime.version,
       message: [
         `已同步 ${result.result.actionCount} 个动作、${result.result.assetCount} 个资源。`,
+        `本次上传 ${uploadedAssetCount} 个资源，复用 ${reusedAssetCount} 个。`,
         result.result.prefabPathAdjustedFrom ? `检测到旧${actorLabel}生成路径，已自动改为独立 Prefab：\n${result.result.prefabPath}` : "",
         result.result.jsonPath,
         `${isEnemy ? "敌人" : "角色"} Prefab：${result.result.prefabPath}`,
