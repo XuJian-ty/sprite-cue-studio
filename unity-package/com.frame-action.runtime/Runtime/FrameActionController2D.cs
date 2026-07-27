@@ -4,7 +4,7 @@ using UnityEngine;
 namespace FrameAction
 {
     [RequireComponent(typeof(FrameActionPlayer))]
-    public sealed class FrameActionController2D : MonoBehaviour, IFrameActionDamageReceiver, IFrameActionStatusReceiver
+    public sealed class FrameActionController2D : MonoBehaviour, IFrameActionDamageReceiver, IFrameActionInvincibilityReceiver, IFrameActionStatusReceiver
     {
         public FrameActionPlayer player;
         public bool grounded = true;
@@ -18,6 +18,7 @@ namespace FrameAction
         public bool IsStunned => Time.time < _stunnedUntil;
         public bool HasSuperArmor => Time.time < _superArmorUntil;
         public bool IsInvincible => Time.time < _invincibleUntil;
+        public bool IsFrameActionInvincible => IsInvincible;
         public bool IsLocomotionInputLocked
         {
             get

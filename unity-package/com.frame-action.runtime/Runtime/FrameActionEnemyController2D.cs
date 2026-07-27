@@ -9,7 +9,7 @@ namespace FrameAction
     /// locomotion motor, camera ownership, buffering, or transition policy.
     /// </summary>
     [DisallowMultipleComponent]
-    public sealed class FrameActionEnemyController2D : MonoBehaviour, IFrameActionDamageReceiver, IFrameActionStatusReceiver
+    public sealed class FrameActionEnemyController2D : MonoBehaviour, IFrameActionDamageReceiver, IFrameActionInvincibilityReceiver, IFrameActionStatusReceiver
     {
         public FrameActionPlayer player;
         public bool playGroundIdleOnEnable = true;
@@ -23,6 +23,7 @@ namespace FrameAction
         public bool IsStunned => Time.time < _stunnedUntil;
         public bool HasSuperArmor => Time.time < _superArmorUntil;
         public bool IsInvincible => Time.time < _invincibleUntil;
+        public bool IsFrameActionInvincible => IsInvincible;
         public bool IsHurtLocked => IsPlaying && CurrentActionType == "hurt";
         public bool IsActionLocked => IsStunned || IsHurtLocked;
         public bool MovementLocked

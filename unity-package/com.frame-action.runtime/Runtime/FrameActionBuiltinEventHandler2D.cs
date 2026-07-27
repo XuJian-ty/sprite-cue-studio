@@ -402,6 +402,7 @@ namespace FrameAction
             if ((mask & (1 << targetCollider.gameObject.layer)) == 0) return;
             Transform hitTarget = ResolveHitTarget(targetCollider);
             if (hitTarget == null) return;
+            if (IsInvincibleTarget(hitTarget)) return;
             if (!IsEligibleHurtbox(targetCollider, hitTarget)) return;
             int id = hitTarget.GetInstanceID();
             if (!hitIds.Add(id)) return;
@@ -448,6 +449,7 @@ namespace FrameAction
             {
                 Transform hitTarget = ResolveHitTarget(targetCollider);
                 if (hitTarget == null) continue;
+                if (IsInvincibleTarget(hitTarget)) continue;
                 if (!IsEligibleHurtbox(targetCollider, hitTarget)) continue;
                 int id = hitTarget.GetInstanceID();
                 if (!hitIds.Add(id)) continue;
@@ -490,6 +492,7 @@ namespace FrameAction
             if (delay > 0f) yield return new WaitForSeconds(delay);
             bool untilActionEnd = String(effect, "durationMode") == "untilActionEnd";
             if (untilActionEnd && IsExecutionEnded(context.actionExecutionId)) yield break;
+            if (IsInvincibleTarget(targetTransform)) yield break;
 
             // A map's CompositeCollider2D is backed by a static Rigidbody2D. It can
             // be returned by targetCollider.attachedRigidbody when an attack query
@@ -1172,6 +1175,13 @@ namespace FrameAction
             if (statusReceiver != null) return statusReceiver.transform;
             if (collider.attachedRigidbody != null) return collider.attachedRigidbody.transform;
             return collider.transform;
+        }
+
+        private static bool IsInvincibleTarget(Transform target)
+        {
+            return target != null && target.GetComponentsInParent<MonoBehaviour>(true)
+                .OfType<IFrameActionInvincibilityReceiver>()
+                .Any(receiver => receiver != null && receiver.IsFrameActionInvincible);
         }
 
         private static bool IsEligibleHurtbox(Collider2D collider, Transform hitTarget)

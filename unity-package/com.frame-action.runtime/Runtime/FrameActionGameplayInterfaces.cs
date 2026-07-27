@@ -28,6 +28,11 @@ namespace FrameAction
         void ReceiveFrameActionDamage(FrameActionDamageContext context);
     }
 
+    public interface IFrameActionInvincibilityReceiver
+    {
+        bool IsFrameActionInvincible { get; }
+    }
+
     public interface IFrameActionDeathReceiver
     {
         void ReceiveFrameActionDeath();
