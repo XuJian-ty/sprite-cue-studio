@@ -3,11 +3,12 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const os = require("os");
+const { pathToFileURL } = require("url");
 const sharp = require("sharp");
 
 const ROOT = __dirname;
 const DIST = path.join(ROOT, "dist");
-const PROJECT_SCHEMA_VERSION = 11;
+const PROJECT_SCHEMA_VERSION = 12;
 const RUNTIME_PACKAGE_NAME = "com.frame-action.runtime";
 const PORT = Number(process.env.PORT || 5188);
 const JSON_BODY_LIMIT = 150 * 1024 * 1024;
@@ -16,6 +17,8 @@ const ACTOR_ASSET_CHUNK_LIMIT = 8 * 1024 * 1024;
 const MAP_BACKGROUND_TILE_SIZE = 4096;
 const mapAssetUploads = new Map();
 const actorSyncUploads = new Map();
+const actorAssetManifestCache = new Map();
+let mapIceGeometry = null;
 
 function sendJson(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -139,6 +142,31 @@ function runtimeInfo(root) {
 
 function runtimeStatus(root) {
   return runtimeInfo(root);
+}
+
+function readUnityPropertyCatalog(root) {
+  const catalogPath = path.join(root, "Library", "FrameActionStudio", "property-catalog.json");
+  if (!fs.existsSync(catalogPath)) {
+    return {
+      properties: [],
+      message: "Unity 尚未生成可修改属性目录。请等待 Unity 编译完成，或重新聚焦 Unity 编辑器。",
+    };
+  }
+  const value = JSON.parse(fs.readFileSync(catalogPath, "utf8"));
+  const properties = (Array.isArray(value?.properties) ? value.properties : [])
+    .filter((item) => item && typeof item === "object" && String(item.id || "").trim())
+    .map((item) => ({
+      id: String(item.id).trim(),
+      displayName: String(item.displayName || item.id).trim(),
+      category: String(item.category || "其他").trim(),
+      allowTemporary: item.allowTemporary !== false,
+      allowPermanent: item.allowPermanent !== false,
+    }))
+    .sort((left, right) => left.category.localeCompare(right.category, "zh-CN") || left.displayName.localeCompare(right.displayName, "zh-CN"));
+  return {
+    properties,
+    message: properties.length ? "" : "Unity 属性目录为空，请在游戏代码中注册可修改属性。",
+  };
 }
 
 function requireCompatibleRuntime(root) {
@@ -597,11 +625,48 @@ function loadUnityActor(root, relativeJsonPath, actorKind) {
     const assetPath = path.resolve(dataRoot, asset.path);
     const assetRelative = path.relative(dataRoot, assetPath);
     if (assetRelative.startsWith("..") || path.isAbsolute(assetRelative) || !fs.existsSync(assetPath) || !fs.statSync(assetPath).isFile()) continue;
-    const dataUrl = encodeFileDataUrl(assetPath, asset.kind);
-    loadedAssets.push({ ...asset, dataUrl, url: dataUrl });
+    const params = new URLSearchParams({
+      projectPath: root,
+      jsonPath: path.relative(root, jsonPath).replace(/\\/g, "/"),
+      assetId: String(asset.id),
+    });
+    loadedAssets.push({ ...asset, url: `/api/unity/actor-asset?${params}` });
   }
   const { assets, sync, ...project } = materialized;
   return { project, assets: loadedAssets, syncedAt: sync?.syncedAt || null };
+}
+
+function resolveUnityActorAsset(root, relativeJsonPath, assetId) {
+  const jsonPath = path.resolve(root, String(relativeJsonPath || ""));
+  const actorRoots = [unityCharacterDataRoot(root), unityEnemyDataRoot(root)].map((value) => path.resolve(value));
+  const insideActorRoot = actorRoots.some((actorRoot) => {
+    const relative = path.relative(actorRoot, jsonPath);
+    return relative && !relative.startsWith("..") && !path.isAbsolute(relative);
+  });
+  if (!insideActorRoot || !jsonPath.endsWith(".frame-action.json")) throw new Error("角色资源清单路径无效");
+  if (!fs.existsSync(jsonPath) || !fs.statSync(jsonPath).isFile()) throw new Error("角色资源清单不存在");
+
+  const modifiedAt = fs.statSync(jsonPath).mtimeMs;
+  let manifest = actorAssetManifestCache.get(jsonPath);
+  if (!manifest || manifest.modifiedAt !== modifiedAt) {
+    const materialized = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
+    if (materialized.format !== "frame-action-project" || !Array.isArray(materialized.assets)) throw new Error("角色资源清单格式无效");
+    manifest = {
+      modifiedAt,
+      assets: new Map(materialized.assets.filter((item) => item?.id).map((item) => [String(item.id), item])),
+    };
+    actorAssetManifestCache.set(jsonPath, manifest);
+  }
+  const asset = manifest.assets.get(String(assetId || ""));
+  if (!asset?.path) throw new Error("角色资源不存在");
+
+  const dataRoot = path.dirname(jsonPath);
+  const assetPath = path.resolve(dataRoot, asset.path);
+  const relative = path.relative(dataRoot, assetPath);
+  if (relative.startsWith("..") || path.isAbsolute(relative) || !fs.existsSync(assetPath) || !fs.statSync(assetPath).isFile()) {
+    throw new Error("角色资源文件不存在或路径越界");
+  }
+  return { assetPath, kind: asset.kind };
 }
 
 function loadUnityCharacter(root, relativeJsonPath) {
@@ -753,6 +818,29 @@ function layoutEnemyBehaviorNodes(rootNodeId, nodes) {
   }
 }
 
+function stableDataId(prefix, seed) {
+  return `${prefix}_${crypto.createHash("sha256").update(String(seed)).digest("hex").slice(0, 16)}`;
+}
+
+function normalizeAttributeEffect(value, nested, ownerKey) {
+  const source = value && typeof value === "object" ? value : {};
+  const normalized = {
+    id: String(source.id || stableDataId("attribute", ownerKey)),
+    propertyId: String(source.propertyId || source.targetPropertyId || ""),
+    fixedValue: Number.isFinite(Number(source.fixedValue)) ? Number(source.fixedValue) : 0,
+    references: (Array.isArray(source.references) ? source.references : []).map((reference, referenceIndex) => ({
+      id: String(reference?.id || stableDataId("reference", `${ownerKey}:${referenceIndex}`)),
+      propertyId: String(reference?.propertyId || ""),
+      percent: Number.isFinite(Number(reference?.percent)) ? Number(reference.percent) : 0,
+      ...(nested ? { referenceObject: reference?.referenceObject === "target" ? "target" : "self" } : {}),
+    })),
+    changeType: source.changeType === "temporary" ? "temporary" : "permanent",
+    durationSeconds: Math.max(0, Number(source.durationSeconds) || 0),
+  };
+  if (nested) normalized.targetObject = source.targetObject === "self" ? "self" : "target";
+  return normalized;
+}
+
 function migrateCharacterProject(value) {
   if (!value || typeof value !== "object") return value;
   const project = JSON.parse(JSON.stringify(value));
@@ -765,7 +853,7 @@ function migrateCharacterProject(value) {
     const jumpSegment = jump?.segments?.[0];
     const existingIds = new Set(actions.map((action) => action?.id).filter(Boolean));
     const dropId = existingIds.has("drop-through") ? "drop-through-default" : "drop-through";
-    const trackKinds = ["damage", "physics", "vfx", "sfx", "speed", "camera"];
+    const trackKinds = ["damage", "physics", "vfx", "sfx", "attribute", "speed", "camera"];
     const dropThrough = {
       id: dropId,
       name: "下跳",
@@ -797,7 +885,7 @@ function migrateCharacterProject(value) {
         jumpHeight: 2.4,
         frames: [],
         markers: [],
-        tracks: trackKinds.map((kind) => ({ id: `track-drop-through-${kind}`, name: ({ damage: "命中", physics: "物理", vfx: "特效", sfx: "音效", speed: "速度", camera: "镜头" })[kind], kind, events: [] })),
+        tracks: trackKinds.map((kind) => ({ id: `track-drop-through-${kind}`, name: ({ damage: "命中", physics: "物理", vfx: "特效", sfx: "音效", attribute: "属性", speed: "速度", camera: "镜头" })[kind], kind, events: [] })),
       }],
     };
     for (const action of actions) {
@@ -816,13 +904,25 @@ function migrateCharacterProject(value) {
       ? action.acceptJumpInput
       : false;
     for (const segment of Array.isArray(action.segments) ? action.segments : []) {
-      for (const track of Array.isArray(segment?.tracks) ? segment.tracks : []) {
+      segment.tracks = Array.isArray(segment?.tracks) ? segment.tracks : [];
+      if (!segment.tracks.some((track) => track?.kind === "attribute")) {
+        segment.tracks.push({ id: stableDataId("track_attribute", segment.id || action.id || "segment"), name: "属性", kind: "attribute", events: [] });
+      }
+      for (const track of segment.tracks) {
         for (const event of Array.isArray(track?.events) ? track.events : []) {
           const params = event?.params && typeof event.params === "object" ? event.params : {};
+          event.params = params;
           const vfxEffects = track.kind === "vfx" && Array.isArray(params.vfxEffects) ? params.vfxEffects : [];
           const damageEffects = track.kind === "damage" && Array.isArray(params.damageEffects) ? params.damageEffects : [];
+          if (track.kind === "attribute") {
+            params.attributeEffects = (Array.isArray(params.attributeEffects) ? params.attributeEffects : [])
+              .map((effect, effectIndex) => normalizeAttributeEffect(effect, false, `${event.id || "event"}:${effectIndex}`));
+          }
           for (const effect of vfxEffects) if (effect && typeof effect === "object") effect.renderLayer = effect.renderLayer === "back" ? "back" : "front";
-          for (const damageEffect of damageEffects) {
+          for (let damageIndex = 0; damageIndex < damageEffects.length; damageIndex += 1) {
+            const damageEffect = damageEffects[damageIndex];
+            damageEffect.onHitAttributeEffects = (Array.isArray(damageEffect?.onHitAttributeEffects) ? damageEffect.onHitAttributeEffects : [])
+              .map((effect, effectIndex) => normalizeAttributeEffect(effect, true, `${event.id || "event"}:${damageIndex}:${effectIndex}`));
             const nestedEffects = [
               ...(Array.isArray(damageEffect?.companionVfxEffects) ? damageEffect.companionVfxEffects : []),
               ...(Array.isArray(damageEffect?.onHitVfxEffects) ? damageEffect.onHitVfxEffects : []),
@@ -965,7 +1065,7 @@ function migrateCharacterProject(value) {
   } else {
     for (const action of actions) if (action) delete action.enemySkill;
   }
-  project.version = 11;
+  project.version = 12;
   return project;
 }
 
@@ -1284,14 +1384,70 @@ function loadMapAsset(dataRoot, entry, usage, defaultLayer) {
     defaultLayer: defaultLayer || "decoration",
     width: Number(entry.width) || 1,
     height: Number(entry.height) || 1,
-    outlines: normalizeMapOutlineList(entry.outlines, Number(entry.width) || 1, Number(entry.height) || 1),
+    outlines: normalizeMapOutlineList(entry.outlines, Number(entry.width) || 1, Number(entry.height) || 1, true),
     draftOutlines: [],
     dataUrl,
     url: dataUrl,
   };
 }
 
-function normalizeMapOutlineData(outline = {}, width = Number.POSITIVE_INFINITY, height = Number.POSITIVE_INFINITY) {
+const MAP_ELEMENTS = new Set(["fire", "ice", "water", "wind", "light", "dark", "thunder"]);
+
+function normalizeMapElement(value, fallback = "water") {
+  const normalized = String(value || "").toLowerCase();
+  return MAP_ELEMENTS.has(normalized) ? normalized : fallback;
+}
+
+const LEGACY_MATTER_COLORS = {
+  fire: "#ff542c", ice: "#65cdf2", water: "#287bd8", wind: "#7be1ba",
+  light: "#ffe174", dark: "#5a2d82", thunder: "#ad68ff",
+};
+
+function finiteMatterValue(value, fallback, minimum, maximum) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(minimum, Math.min(maximum, parsed)) : fallback;
+}
+
+function matterColor(value, fallback) {
+  const text = String(value || "").trim();
+  return /^#[0-9a-f]{6}$/i.test(text) ? text.toLowerCase() : fallback;
+}
+
+function normalizeMatterProfileData(carrier, elementTag, profile = {}) {
+  const defaultColor = LEGACY_MATTER_COLORS[String(elementTag).toLowerCase()] || "#44aee8";
+  const visual = profile.visual || {};
+  const physical = profile.physical || {};
+  const gas = carrier === "gas";
+  return {
+    schemaVersion: 1,
+    visual: {
+      baseColor: matterColor(visual.baseColor, defaultColor),
+      secondaryColor: matterColor(visual.secondaryColor, defaultColor),
+      emissionColor: matterColor(visual.emissionColor, "#000000"),
+      opacity: finiteMatterValue(visual.opacity, 0.78, 0, 1),
+      particleScale: finiteMatterValue(visual.particleScale, 1, 0.1, 4),
+      edgeSoftness: finiteMatterValue(visual.edgeSoftness, 0.28, 0, 1),
+      detailScale: finiteMatterValue(visual.detailScale, 1, 0.1, 8),
+      refractionStrength: finiteMatterValue(visual.refractionStrength, gas ? 0 : 0.12, 0, 1),
+      glowStrength: finiteMatterValue(visual.glowStrength, 0, 0, 8),
+      foamAmount: finiteMatterValue(visual.foamAmount, gas ? 0 : 0.08, 0, 1),
+    },
+    physical: {
+      density: finiteMatterValue(physical.density, gas ? 0.85 : 1, 0.001, 100),
+      viscosity: finiteMatterValue(physical.viscosity, gas ? 0.08 : 0.18, 0, 8),
+      surfaceTension: finiteMatterValue(physical.surfaceTension, gas ? 0 : 0.34, 0, 4),
+      flowSpeed: finiteMatterValue(physical.flowSpeed, 1, 0.05, 8),
+      gravityScale: finiteMatterValue(physical.gravityScale, gas ? 0 : 1, -4, 4),
+      diffusion: finiteMatterValue(physical.diffusion, gas ? 0.42 : 0.02, 0, 4),
+      buoyancy: finiteMatterValue(physical.buoyancy, gas ? 0.22 : 0, -4, 4),
+      drag: finiteMatterValue(physical.drag, gas ? 0.08 : 0.04, 0, 8),
+      evaporationHalfLifeSeconds: finiteMatterValue(physical.evaporationHalfLifeSeconds, gas ? 0 : 1200, 0, 86400),
+      dissipationHalfLifeSeconds: finiteMatterValue(physical.dissipationHalfLifeSeconds, gas ? 1200 : 0, 0, 86400),
+    },
+  };
+}
+
+function normalizeMapOutlineData(outline = {}, width = Number.POSITIVE_INFINITY, height = Number.POSITIVE_INFINITY, assetTemplate = false) {
   const legacyLineRoad = outline.shape === "lineRoad" || outline.shape === "oneWayLine";
   const rectangleCollision = legacyLineRoad || outline.shape === "groundLine";
   const thickness = rectangleCollision ? Math.max(1, Number(outline.thickness) || 1) : Math.max(0, Number(outline.thickness) || 0);
@@ -1306,29 +1462,46 @@ function normalizeMapOutlineData(outline = {}, width = Number.POSITIVE_INFINITY,
     const end = points[points.length - 1];
     points = [start, end, { x: end.x, y: Math.min(height, end.y + thickness) }, { x: start.x, y: Math.min(height, start.y + thickness) }];
   }
-  const layer = outline.layer === "occlusion" ? "occlusion" : "collision";
-  return {
+  const layer = outline.layer === "occlusion" ? "occlusion" : outline.layer === "rigid" ? "rigid" : "collision";
+  const element = normalizeMapElement(outline.element, "fire");
+  const normalized = {
     id: String(outline.id || `map_outline_${Date.now()}`),
     layer,
+    element,
     shape: rectangleCollision ? "groundLine" : "polygon",
     collisionType: layer === "occlusion" ? "trigger" : outline.collisionType === "oneWay" ? "oneWay" : "solid",
     sideCollision: legacyLineRoad ? false : outline.sideCollision !== false,
     thickness,
     closed: outline.closed !== false,
     points,
+    ...(layer === "rigid" && outline.rigidBody && typeof outline.rigidBody === "object"
+      ? { rigidBody: outline.rigidBody }
+      : layer === "rigid" && outline.iceBody && typeof outline.iceBody === "object"
+        ? { iceBody: outline.iceBody }
+        : {}),
   };
+  if (layer === "rigid" && normalized.shape === "polygon" && normalized.closed) {
+    if (!mapIceGeometry) throw new Error("程序刚体升级器尚未初始化");
+    return assetTemplate
+      ? mapIceGeometry.ensureProgramRigidAssetOutline(normalized)
+      : mapIceGeometry.ensureProgramRigidOutline(normalized);
+  }
+  return normalized;
 }
 
-function normalizeMapOutlineList(outlines, width = Number.POSITIVE_INFINITY, height = Number.POSITIVE_INFINITY) {
+function normalizeMapOutlineList(outlines, width = Number.POSITIVE_INFINITY, height = Number.POSITIVE_INFINITY, assetTemplate = false) {
   return (Array.isArray(outlines) ? outlines : [])
-    .map((outline) => normalizeMapOutlineData(outline, width, height))
+    .map((outline) => normalizeMapOutlineData(outline, width, height, assetTemplate))
     .filter((outline) => outline.shape === "groundLine" ? outline.points.length >= 4 : outline.points.length >= 3);
 }
 
 function normalizeMapObjectData(item = {}) {
   const motion = item.motion || {};
+  const { outlinePrecision: _legacyOutlinePrecision, ...normalizedItem } = item;
   return {
-    ...item,
+    ...normalizedItem,
+    layer: ["decoration", "collision", "rigid", "occlusion"].includes(item.layer) ? item.layer : "decoration",
+    elementTag: String(item.elementTag || normalizeMapElement(item.element, "fire")).trim() || "fire",
     mode: item.mode === "dynamic" ? "dynamic" : "static",
     collisionType: item.collisionType === "solid" ? "solid" : "oneWay",
     motion: {
@@ -1340,6 +1513,23 @@ function normalizeMapObjectData(item = {}) {
       endpointPauseSeconds: Math.max(0, Number(motion.endpointPauseSeconds) || 0),
       phaseSeconds: Math.max(0, Number(motion.phaseSeconds) || 0),
     },
+  };
+}
+
+function normalizeMatterStrokeData(stroke = {}, width = Number.POSITIVE_INFINITY, height = Number.POSITIVE_INFINITY) {
+  const carrier = stroke.carrier === "gas" ? "gas" : "liquid";
+  const legacyElement = normalizeMapElement(stroke.element, carrier === "gas" ? "wind" : "water");
+  const elementTag = String(stroke.elementTag || legacyElement).trim() || legacyElement;
+  return {
+    id: String(stroke.id || `map_matter_${Date.now()}`),
+    carrier,
+    elementTag,
+    profile: normalizeMatterProfileData(carrier, elementTag, stroke.profile),
+    radius: Math.max(1, Math.min(256, Number(stroke.radius) || 12)),
+    points: (Array.isArray(stroke.points) ? stroke.points : []).map((point) => ({
+      x: Math.max(0, Math.min(width, Number(point?.x) || 0)),
+      y: Math.max(0, Math.min(height, Number(point?.y) || 0)),
+    })),
   };
 }
 
@@ -1357,7 +1547,7 @@ function loadUnityMap(root, relativeJsonPath) {
       if (background) loadedAssets.unshift(background);
     }
     const { assets, sync, backgroundTiles, backgroundSource, ...project } = data;
-    return { project: { ...project, version: 2, objects: (project.objects || []).map(normalizeMapObjectData), draftOutlines: project.draftOutlines || [] }, assets: loadedAssets, syncedAt: sync?.syncedAt || null };
+    return { project: { ...project, version: 2, objects: (project.objects || []).map(normalizeMapObjectData), outlines: normalizeMapOutlineList(project.outlines, project.width, project.height), matterStrokes: (project.matterStrokes || []).map((stroke) => normalizeMatterStrokeData(stroke, project.width, project.height)).filter((stroke) => stroke.points.length), draftOutlines: project.draftOutlines || [] }, assets: loadedAssets, syncedAt: sync?.syncedAt || null };
   }
   if (data.tool !== "2d-game-helper-map-editor") throw new Error("不是可识别的地图数据");
 
@@ -1387,13 +1577,13 @@ function loadUnityMap(root, relativeJsonPath) {
     objects: legacyObjects.map((item) => normalizeMapObjectData({
       id: item.id || `map_object_${Date.now()}`,
       assetId: item.assetId || "",
-      layer: ["decoration", "collision", "occlusion"].includes(item.layer) ? item.layer : "decoration",
+      layer: ["decoration", "collision", "rigid", "occlusion"].includes(item.layer) ? item.layer : "decoration",
+      element: normalizeMapElement(item.element, "fire"),
       x: Number(item.x) || 0,
       y: Number(item.y) || 0,
       scale: Math.max(0.01, Number(item.scale) || 1),
       rotation: Number(item.rotation) || 0,
       z: Number(item.z) || 0,
-      outlinePrecision: ["low", "medium", "high", "ultra"].includes(item.outlinePrecision) ? item.outlinePrecision : "medium",
     })),
     outlines: (Array.isArray(data.outlines) ? data.outlines : []).map((outline) => {
       const legacyLineRoad = outline.shape === "lineRoad" || outline.shape === "oneWayLine";
@@ -1407,7 +1597,8 @@ function loadUnityMap(root, relativeJsonPath) {
       }
       return {
         id: outline.id || `map_outline_${Date.now()}`,
-        layer: outline.layer === "occlusion" ? "occlusion" : "collision",
+        layer: outline.layer === "occlusion" ? "occlusion" : outline.layer === "rigid" ? "rigid" : "collision",
+        element: normalizeMapElement(outline.element, "fire"),
         shape: outline.shape === "groundLine" || legacyLineRoad ? "groundLine" : "polygon",
         collisionType: outline.layer === "occlusion" ? "trigger" : outline.collisionType === "oneWay" ? "oneWay" : "solid",
         sideCollision: legacyLineRoad ? false : outline.sideCollision !== false,
@@ -1417,6 +1608,7 @@ function loadUnityMap(root, relativeJsonPath) {
       };
     }),
     draftOutlines: [],
+    matterStrokes: [],
   };
   return { project, assets: loadedAssets, syncedAt: fs.statSync(jsonPath).mtime.toISOString() };
 }
@@ -1537,6 +1729,9 @@ async function syncMap(root, payload) {
   project.version = 2;
   project.objects = (Array.isArray(project.objects) ? project.objects : []).map(normalizeMapObjectData);
   project.outlines = normalizeMapOutlineList(project.outlines, Math.max(1, Number(project.width) || 1), Math.max(1, Number(project.height) || 1));
+  project.matterStrokes = (Array.isArray(project.matterStrokes) ? project.matterStrokes : [])
+    .map((stroke) => normalizeMatterStrokeData(stroke, Math.max(1, Number(project.width) || 1), Math.max(1, Number(project.height) || 1)))
+    .filter((stroke) => stroke.points.length);
   project.mapName = String(project.mapName || "").trim();
   if (!project.mapName) throw new Error("地图名称不能为空");
   const targetMap = findUnityMapByJsonPath(root, payload.targetJsonPath);
@@ -1603,7 +1798,7 @@ async function syncMap(root, payload) {
       width: assetWidth,
       height: assetHeight,
       path: relativePath,
-      outlines: normalizeMapOutlineList(asset.outlines, assetWidth, assetHeight),
+      outlines: normalizeMapOutlineList(asset.outlines, assetWidth, assetHeight, true),
     });
   }
 
@@ -1751,12 +1946,28 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
     if (req.method === "GET" && url.pathname === "/api/status") {
-      return sendJson(res, 200, { ok: true, version: "0.34.8" });
+      return sendJson(res, 200, { ok: true, version: "0.35.0" });
+    }
+    if (req.method === "GET" && url.pathname === "/api/unity/actor-asset") {
+      const root = validateUnityProject(url.searchParams.get("projectPath"));
+      const { assetPath, kind } = resolveUnityActorAsset(root, url.searchParams.get("jsonPath"), url.searchParams.get("assetId"));
+      const contents = fs.readFileSync(assetPath);
+      res.writeHead(200, {
+        "Content-Type": fileMimeType(assetPath, kind),
+        "Content-Length": contents.length,
+        "Cache-Control": "no-cache",
+      });
+      return res.end(contents);
     }
     if (req.method === "POST" && url.pathname === "/api/unity/check") {
       const body = await readBody(req);
       const root = validateUnityProject(body.projectPath);
       return sendJson(res, 200, { ok: true, projectPath: root, runtime: runtimeStatus(root) });
+    }
+    if (req.method === "POST" && url.pathname === "/api/unity/properties") {
+      const body = await readBody(req);
+      const root = validateUnityProject(body.projectPath);
+      return sendJson(res, 200, { ok: true, ...readUnityPropertyCatalog(root) });
     }
     if (req.method === "POST" && url.pathname === "/api/unity/sync") {
       const body = await readBody(req);
@@ -1900,6 +2111,14 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`SpriteCue Studio running at http://127.0.0.1:${PORT}`);
+async function startServer() {
+  mapIceGeometry = await import(pathToFileURL(path.join(ROOT, "src", "mapIceGeometry.ts")).href);
+  server.listen(PORT, "127.0.0.1", () => {
+    console.log(`SpriteCue Studio running at http://127.0.0.1:${PORT}`);
+  });
+}
+
+startServer().catch((error) => {
+  console.error("SpriteCue Studio failed to initialize", error);
+  process.exitCode = 1;
 });

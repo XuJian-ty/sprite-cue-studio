@@ -98,7 +98,7 @@ namespace FrameAction
 
         public bool CanHandle(string eventType)
         {
-            return eventType == "damage" || eventType == "physics" || eventType == "vfx" || eventType == "sfx" || eventType == "camera";
+            return eventType == "damage" || eventType == "physics" || eventType == "vfx" || eventType == "sfx" || eventType == "attribute" || eventType == "camera";
         }
 
         public void OnEnter(FrameActionEventContext context)
@@ -117,6 +117,9 @@ namespace FrameAction
                     break;
                 case "sfx":
                     foreach (JObject effect in Objects(parameters["sfxEffects"])) StartCoroutine(PlaySfxAfterDelay(effect, null, null, false, context.actionExecutionId));
+                    break;
+                case "attribute":
+                    foreach (JObject effect in Objects(parameters["attributeEffects"])) ApplyAttributeEffect(effect, null, context, false);
                     break;
                 case "camera":
                     _activeCameraEvents.Add(CameraEventKey(context));
@@ -398,8 +401,14 @@ namespace FrameAction
         private void DetectPhysicalContact(JObject effect, Collider2D targetCollider, Vector2 hitPoint, Vector2 effectOrigin, HashSet<int> hitIds, FrameActionEventContext context)
         {
             if (targetCollider == null) return;
+            FrameActionMatterImpactBus.Publish(new FrameActionMatterImpactContext(
+                player,
+                hitPoint,
+                Mathf.Max(0.05f, Float(effect, "radius", 0.12f)),
+                Mathf.Max(0.05f, Float(effect, "matterReactionStrength", 1f)),
+                context.actionExecutionId));
             int mask = ResolveMask(String(effect, "hitLayerName", "Enemy"));
-            if ((mask & (1 << targetCollider.gameObject.layer)) == 0) return;
+            if (!IsActionOrEnvironmentalTarget(targetCollider, mask)) return;
             Transform hitTarget = ResolveHitTarget(targetCollider);
             if (hitTarget == null) return;
             if (IsInvincibleTarget(hitTarget)) return;
@@ -418,6 +427,17 @@ namespace FrameAction
             float rotation = ResolveDetectionRotation(effect, sourceRotation, facingSign);
             Vector2 boxSize = new Vector2(Mathf.Max(0.01f, Float(effect, "boxWidth", 1f)), Mathf.Max(0.01f, Float(effect, "boxHeight", 1f)));
             ApplyBoxGrowth(effect, elapsed, rotation, facingSign, ref center, ref boxSize);
+            float matterRadius = String(effect, "shape", "box") == "box"
+                ? Mathf.Max(boxSize.x, boxSize.y) * 0.5f
+                : Mathf.Max(0.01f, Float(effect, "radius", 1f));
+            if (detectionType == "raycast")
+                matterRadius = Mathf.Max(matterRadius, Float(effect, "rayRadius", 0.08f));
+            FrameActionMatterImpactBus.Publish(new FrameActionMatterImpactContext(
+                player,
+                center,
+                matterRadius,
+                Mathf.Max(0.05f, Float(effect, "matterReactionStrength", 1f)),
+                context.actionExecutionId));
             IEnumerable<Collider2D> colliders;
 
             if (detectionType == "raycast")
@@ -426,17 +446,17 @@ namespace FrameAction
                 float distance = Mathf.Max(0.01f, Float(effect, "rayMaxDistance", 10f));
                 float radius = Mathf.Max(0f, Float(effect, "rayRadius"));
                 colliders = radius > 0.001f
-                    ? Physics2D.CircleCastAll(center, radius, direction, distance, mask).Select(hit => hit.collider)
-                    : Physics2D.RaycastAll(center, direction, distance, mask).Select(hit => hit.collider);
+                    ? Physics2D.CircleCastAll(center, radius, direction, distance, ~0).Select(hit => hit.collider)
+                    : Physics2D.RaycastAll(center, direction, distance, ~0).Select(hit => hit.collider);
             }
             else if (String(effect, "shape", "box") == "box")
             {
-                colliders = Physics2D.OverlapBoxAll(center, boxSize, rotation, mask);
+                colliders = Physics2D.OverlapBoxAll(center, boxSize, rotation, ~0);
             }
             else
             {
                 float radius = Mathf.Max(0.01f, Float(effect, "radius", 1f));
-                colliders = Physics2D.OverlapCircleAll(center, radius, mask);
+                colliders = Physics2D.OverlapCircleAll(center, radius, ~0);
                 if (String(effect, "shape") == "sector")
                 {
                     float halfAngle = Mathf.Max(1f, Float(effect, "sectorAngle", 180f)) * 0.5f;
@@ -447,6 +467,7 @@ namespace FrameAction
 
             foreach (Collider2D targetCollider in colliders.Where(item => item != null).Distinct())
             {
+                if (!IsActionOrEnvironmentalTarget(targetCollider, mask)) continue;
                 Transform hitTarget = ResolveHitTarget(targetCollider);
                 if (hitTarget == null) continue;
                 if (IsInvincibleTarget(hitTarget)) continue;
@@ -459,7 +480,9 @@ namespace FrameAction
 
         private void ApplyHit(JObject effect, Collider2D targetCollider, Transform hitTarget, Vector2 hitPoint, Vector2 effectOrigin, FrameActionEventContext context)
         {
-            foreach (JObject damage in Objects(effect["onHitDamageEffects"])) StartCoroutine(ApplyDamageAfterDelay(damage, hitTarget, hitPoint));
+            foreach (JObject damage in Objects(effect["onHitDamageEffects"]))
+                StartCoroutine(ApplyDamageAfterDelay(damage, hitTarget, hitPoint, context.actionExecutionId));
+            foreach (JObject attribute in Objects(effect["onHitAttributeEffects"])) ApplyAttributeEffect(attribute, hitTarget, context, true);
             foreach (JObject physics in Objects(effect["onHitPhysicsEffects"])) ApplyPhysicsEffect(physics, targetCollider.attachedRigidbody ?? targetCollider.GetComponentInParent<Rigidbody2D>(), hitTarget, true, effectOrigin, context);
             foreach (JObject cue in Objects(effect["onHitVfxEffects"])) StartCoroutine(SpawnVfxAfterDelay(cue, targetCollider.bounds.center, hitTarget, null, true, null, context.actionExecutionId));
             foreach (JObject cue in Objects(effect["onHitSfxEffects"])) StartCoroutine(PlaySfxAfterDelay(cue, targetCollider.bounds.center, hitTarget, true, context.actionExecutionId));
@@ -468,7 +491,48 @@ namespace FrameAction
             if (applyHitStop && hitStop != null && Int(hitStop, "durationTicks") > 0) StartCoroutine(ApplyHitStop(hitStop));
         }
 
-        private IEnumerator ApplyDamageAfterDelay(JObject effect, Transform hitTarget, Vector2 hitPoint)
+        private void ApplyAttributeEffect(JObject effect, Transform hitTarget, FrameActionEventContext context, bool onHit)
+        {
+            Transform sourceTransform = player != null ? player.transform : transform;
+            IFrameActionPropertyReceiver self = ResolvePropertyReceiver(sourceTransform);
+            IFrameActionPropertyReceiver target = onHit ? ResolvePropertyReceiver(hitTarget) : self;
+            bool applyToTarget = onHit && String(effect, "targetObject", "target") == "target";
+            IFrameActionPropertyReceiver receiver = applyToTarget ? target : self;
+            string propertyId = String(effect, "propertyId");
+            if (receiver == null || string.IsNullOrWhiteSpace(propertyId)) return;
+
+            float amount = Float(effect, "fixedValue");
+            foreach (JObject reference in Objects(effect["references"]))
+            {
+                bool readTarget = onHit && String(reference, "referenceObject", "self") == "target";
+                IFrameActionPropertyReceiver referenceReceiver = readTarget ? target : self;
+                string referencePropertyId = String(reference, "propertyId");
+                if (referenceReceiver == null || string.IsNullOrWhiteSpace(referencePropertyId)) continue;
+                if (referenceReceiver.TryGetFrameActionProperty(referencePropertyId, out float referenceValue))
+                    amount += referenceValue * Float(reference, "percent") / 100f;
+            }
+
+            bool temporary = String(effect, "changeType", "permanent") == "temporary";
+            float durationSeconds = temporary ? Mathf.Max(0f, Float(effect, "durationSeconds")) : 0f;
+            if (temporary && durationSeconds <= 0f) return;
+            string modifierId = $"{context.actionExecutionId}:{context.data.id}:{String(effect, "id", propertyId)}";
+            receiver.ApplyFrameActionProperty(new FrameActionPropertyChangeContext(
+                propertyId,
+                amount,
+                temporary ? FrameActionPropertyChangeType.Temporary : FrameActionPropertyChangeType.Permanent,
+                durationSeconds,
+                modifierId,
+                player));
+        }
+
+        private static IFrameActionPropertyReceiver ResolvePropertyReceiver(Transform target)
+        {
+            return target == null
+                ? null
+                : target.GetComponentsInParent<MonoBehaviour>(true).OfType<IFrameActionPropertyReceiver>().FirstOrDefault();
+        }
+
+        private IEnumerator ApplyDamageAfterDelay(JObject effect, Transform hitTarget, Vector2 hitPoint, int actionExecutionId)
         {
             float delay = TicksToSeconds(Int(effect, "delayTicks"));
             if (delay > 0f) yield return new WaitForSeconds(delay);
@@ -478,7 +542,8 @@ namespace FrameAction
                 player,
                 Float(effect, "damageMultiplier", 1f),
                 Float(effect, "fixedDamage", 0f),
-                hitPoint));
+                hitPoint,
+                actionExecutionId));
         }
 
         private void ApplyPhysicsEffect(JObject effect, Rigidbody2D body, Transform targetTransform, bool onHit, Vector2 effectOrigin, FrameActionEventContext context)
@@ -1194,6 +1259,14 @@ namespace FrameAction
                 if (hurtbox != null && (hurtbox.hurtboxCollider == collider || hurtbox.GetComponent<Collider2D>() == collider)) return true;
             }
             return false;
+        }
+
+        private static bool IsActionOrEnvironmentalTarget(Collider2D collider, int actionMask)
+        {
+            if (collider == null) return false;
+            if ((actionMask & (1 << collider.gameObject.layer)) != 0) return true;
+            return collider.GetComponentsInParent<MonoBehaviour>(true)
+                .Any(component => component is IFrameActionEnvironmentalDamageReceiver);
         }
 
         private Transform ResolveAnchor(string anchor, Transform explicitTarget = null)

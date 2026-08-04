@@ -1,6 +1,7 @@
 import { Grid3X3, Images, Plus, Trash2, Upload } from "lucide-react";
 import { useState } from "react";
-import type { AssetRef, TimelineEvent, TimelineTrack } from "../types";
+import { uid } from "../model";
+import type { AssetRef, TimelineEvent, TimelineTrack, UnityPropertyCatalogEntry } from "../types";
 import DeferredTextInput from "./DeferredTextInput";
 import NumericInput from "./NumericInput";
 
@@ -10,6 +11,8 @@ interface Props {
   tickRate: number;
   defaultPixelsPerUnit: number;
   assets: Record<string, AssetRef>;
+  propertyCatalog: UnityPropertyCatalogEntry[];
+  propertyCatalogMessage: string;
   onUpdate: (patch: Partial<TimelineEvent>) => void;
   onCreateAssets: (files: File[], kind: "image" | "audio") => Promise<string[]>;
   onDelete: () => void;
@@ -49,6 +52,114 @@ function EffectHeader({ title, onAdd }: { title: string; onAdd: () => void }) {
 
 function RemoveButton({ onClick }: { onClick: () => void }) {
   return <button type="button" className="effect-remove" title="删除此项" onClick={onClick}><Trash2 size={14} /></button>;
+}
+
+function PropertyField({ label, value, catalog, onChange }: {
+  label: string;
+  value: string;
+  catalog: UnityPropertyCatalogEntry[];
+  onChange: (value: string) => void;
+}) {
+  const groups = catalog.reduce<Record<string, UnityPropertyCatalogEntry[]>>((result, item) => {
+    const category = item.category || "其他";
+    (result[category] ||= []).push(item);
+    return result;
+  }, {});
+  const known = catalog.some((item) => item.id === value);
+  return <label className="field">
+    <span>{label}</span>
+    <select value={value} onChange={(event) => onChange(event.target.value)}>
+      <option value="">请选择 Unity 属性</option>
+      {value && !known && <option value={value}>{value}（目录中不存在）</option>}
+      {Object.entries(groups).map(([category, entries]) => <optgroup key={category} label={category}>
+        {entries.map((entry) => <option key={entry.id} value={entry.id}>{entry.displayName} · {entry.id}</option>)}
+      </optgroup>)}
+    </select>
+  </label>;
+}
+
+const defaultAttributeReference = (nested: boolean) => ({
+  id: uid("reference"),
+  propertyId: "",
+  percent: 0,
+  ...(nested ? { referenceObject: "self" } : {}),
+});
+
+const defaultAttributeEffect = (nested: boolean) => ({
+  id: uid("attribute"),
+  propertyId: "",
+  fixedValue: 0,
+  references: [],
+  changeType: "permanent",
+  durationSeconds: 0,
+  ...(nested ? { targetObject: "target" } : {}),
+});
+
+function AttributeEffects({ title, values, onChange, propertyCatalog, propertyCatalogMessage, nested }: {
+  title: string;
+  values: any[];
+  onChange: (values: any[]) => void;
+  propertyCatalog: UnityPropertyCatalogEntry[];
+  propertyCatalogMessage: string;
+  nested: boolean;
+}) {
+  const propertyName = (propertyId: string) => propertyCatalog.find((item) => item.id === propertyId)?.displayName || propertyId || "未选择属性";
+  return <div className="nested-effect-list attribute-effect-list">
+    <EffectHeader title={title} onAdd={() => onChange([...values, defaultAttributeEffect(nested)])} />
+    {!propertyCatalog.length && <div className="time-readout">{propertyCatalogMessage || "Unity 尚未提供可修改属性目录。"}</div>}
+    {values.map((effect, index) => {
+      const patch = (next: any) => onChange(values.map((item, cursor) => cursor === index ? { ...item, ...next } : item));
+      const references = Array.isArray(effect.references) ? effect.references : [];
+      const selectedProperty = propertyCatalog.find((item) => item.id === effect.propertyId);
+      const temporary = effect.changeType === "temporary";
+      const unsupportedChangeType = selectedProperty && (temporary ? !selectedProperty.allowTemporary : !selectedProperty.allowPermanent);
+      const selectTargetProperty = (propertyId: string) => {
+        const property = propertyCatalog.find((item) => item.id === propertyId);
+        if (!property) {
+          patch({ propertyId });
+        } else if (temporary && !property.allowTemporary && property.allowPermanent) {
+          patch({ propertyId, changeType: "permanent", durationSeconds: 0 });
+        } else if (!temporary && !property.allowPermanent && property.allowTemporary) {
+          patch({ propertyId, changeType: "temporary", durationSeconds: Math.max(1, numeric(effect.durationSeconds)) });
+        } else {
+          patch({ propertyId });
+        }
+      };
+      return <details className="effect-block" key={effect.id || index} open={index === 0}>
+        <summary><span>{index + 1}. {propertyName(effect.propertyId)}</span><RemoveButton onClick={() => onChange(values.filter((_, cursor) => cursor !== index))} /></summary>
+        <div className="effect-block-body">
+          {nested && <SelectField label="作用对象" value={effect.targetObject === "self" ? "self" : "target"} onChange={(value) => patch({ targetObject: value })} options={[["self", "自身"], ["target", "目标"]]} />}
+          <PropertyField label="目标属性" value={effect.propertyId || ""} catalog={propertyCatalog} onChange={selectTargetProperty} />
+          <div className="field-grid two-columns">
+            <NumberField label="固定值" title="最终改变量会叠加固定值和全部参考属性百分比结果，可填写负数" value={numeric(effect.fixedValue)} step={0.1} onChange={(fixedValue) => patch({ fixedValue })} />
+            <SelectField label="改变方式" value={temporary ? "temporary" : "permanent"} onChange={(changeType) => patch(changeType === "temporary"
+              ? { changeType, durationSeconds: Math.max(1, numeric(effect.durationSeconds)) }
+              : { changeType, durationSeconds: 0 })} options={[["temporary", "临时修正"], ["permanent", "永久变化"]]} />
+            {temporary && <NumberField label="持续时间（秒）" value={numeric(effect.durationSeconds)} min={0.01} step={0.1} onChange={(durationSeconds) => patch({ durationSeconds: Math.max(0.01, durationSeconds) })} />}
+          </div>
+          {unsupportedChangeType && <div className="time-readout">当前 Unity 属性不支持所选改变方式，请切换方式或目标属性。</div>}
+
+          <div className="nested-effect-list attribute-reference-list">
+            <EffectHeader title="参考属性" onAdd={() => patch({ references: [...references, defaultAttributeReference(nested)] })} />
+            {!references.length && <div className="time-readout">最终改变量 = 固定值；添加参考属性后会继续累加“参考值 × 百分比”。</div>}
+            {references.map((reference: any, referenceIndex: number) => {
+              const patchReference = (next: any) => {
+                const nextReferences = structuredClone(references);
+                nextReferences[referenceIndex] = { ...nextReferences[referenceIndex], ...next };
+                patch({ references: nextReferences });
+              };
+              return <div className="attribute-reference-row" key={reference.id || referenceIndex}>
+                {nested && <SelectField label="参考对象" value={reference.referenceObject === "target" ? "target" : "self"} onChange={(referenceObject) => patchReference({ referenceObject })} options={[["self", "自身"], ["target", "目标"]]} />}
+                <PropertyField label="参考属性" value={reference.propertyId || ""} catalog={propertyCatalog} onChange={(propertyId) => patchReference({ propertyId })} />
+                <NumberField label="参考百分比" title="100 表示取参考属性的 100%，可填写负数" value={numeric(reference.percent)} step={1} onChange={(percent) => patchReference({ percent })} />
+                <RemoveButton onClick={() => patch({ references: references.filter((_: any, cursor: number) => cursor !== referenceIndex) })} />
+              </div>;
+            })}
+          </div>
+        </div>
+      </details>;
+    })}
+  </div>;
 }
 
 const PHYSICS_LABELS: Record<string, string> = {
@@ -606,13 +717,15 @@ function SfxEffects({ values, onChange, assets, onCreateAssets, timing, title = 
   </div>;
 }
 
-function DamageEffects({ values, onChange, assets, onCreateAssets, defaultPixelsPerUnit, tickRate }: {
+function DamageEffects({ values, onChange, assets, onCreateAssets, defaultPixelsPerUnit, tickRate, propertyCatalog, propertyCatalogMessage }: {
   values: any[];
   onChange: (values: any[]) => void;
   assets: Record<string, AssetRef>;
   onCreateAssets: Props["onCreateAssets"];
   defaultPixelsPerUnit: number;
   tickRate: number;
+  propertyCatalog: UnityPropertyCatalogEntry[];
+  propertyCatalogMessage: string;
 }) {
   const add = () => onChange([...values, {
     triggerDelayTicks: 0,
@@ -658,6 +771,7 @@ function DamageEffects({ values, onChange, assets, onCreateAssets, defaultPixels
     motion: defaultMotion(),
     companionVfxEffects: [],
     onHitDamageEffects: [{ delayTicks: 0, damageMultiplier: 1, fixedDamage: 0 }],
+    onHitAttributeEffects: [],
     hitStop: { durationTicks: 0, timeScale: 0, pauseCamera: false },
     onHitPhysicsEffects: [],
     onHitVfxEffects: [],
@@ -776,6 +890,15 @@ function DamageEffects({ values, onChange, assets, onCreateAssets, defaultPixels
             </div>)}
           </div>
 
+          <AttributeEffects
+            title="命中属性事件"
+            values={effect.onHitAttributeEffects || []}
+            onChange={(next) => patch({ onHitAttributeEffects: next })}
+            propertyCatalog={propertyCatalog}
+            propertyCatalogMessage={propertyCatalogMessage}
+            nested
+          />
+
           <details className="sub-effect" open>
             <summary>命中停顿</summary>
             <div className="effect-block-body">
@@ -797,7 +920,7 @@ function DamageEffects({ values, onChange, assets, onCreateAssets, defaultPixels
   </div>;
 }
 
-export default function SkillEventInspector({ event, track, tickRate, defaultPixelsPerUnit, assets, onUpdate, onCreateAssets, onDelete }: Props) {
+export default function SkillEventInspector({ event, track, tickRate, defaultPixelsPerUnit, assets, propertyCatalog, propertyCatalogMessage, onUpdate, onCreateAssets, onDelete }: Props) {
   const updateParams = (mutator: (draft: Record<string, any>) => void) => {
     const next = structuredClone(event.params || {});
     mutator(next);
@@ -805,7 +928,7 @@ export default function SkillEventInspector({ event, track, tickRate, defaultPix
   };
   const params = event.params || {};
   const repeated = event.triggerMode === "repeated";
-  const timedTrack = ["damage", "physics", "vfx", "sfx"].includes(track.kind);
+  const timedTrack = ["damage", "physics", "vfx", "sfx", "attribute"].includes(track.kind);
   const intervalTrack = track.kind === "speed" || track.kind === "camera";
   const intervalDurationMode = params.durationMode || "fixed";
 
@@ -831,11 +954,12 @@ export default function SkillEventInspector({ event, track, tickRate, defaultPix
 
     {track.kind === "damage" && <>
       {repeated && <SelectField label="重复锚点模式" title="只影响世界锚点。跟随=每次重复触发重新采样施法者位置；固定=所有重复触发复用第一次采样。自身锚点实时跟随施法者；目标锚点每次触发读取当前目标" value={params.repeatedAnchorMode || "follow"} onChange={(value) => updateParams((draft) => { draft.repeatedAnchorMode = value; })} options={[["follow", "跟随施法者"], ["fixed", "固定首次锚点"]]} />}
-      <DamageEffects values={params.damageEffects || []} onChange={(values) => updateParams((draft) => { draft.damageEffects = values; })} assets={assets} onCreateAssets={onCreateAssets} defaultPixelsPerUnit={defaultPixelsPerUnit} tickRate={tickRate} />
+      <DamageEffects values={params.damageEffects || []} onChange={(values) => updateParams((draft) => { draft.damageEffects = values; })} assets={assets} onCreateAssets={onCreateAssets} defaultPixelsPerUnit={defaultPixelsPerUnit} tickRate={tickRate} propertyCatalog={propertyCatalog} propertyCatalogMessage={propertyCatalogMessage} />
     </>}
     {track.kind === "physics" && <PhysicsEffects values={params.physicsEffects || []} onChange={(values) => updateParams((draft) => { draft.physicsEffects = values; })} scope="topLevel" />}
     {track.kind === "vfx" && <VfxEffects values={params.vfxEffects || []} onChange={(values) => updateParams((draft) => { draft.vfxEffects = values; })} assets={assets} onCreateAssets={onCreateAssets} timing="event" defaultPixelsPerUnit={defaultPixelsPerUnit} />}
     {track.kind === "sfx" && <SfxEffects values={params.sfxEffects || []} onChange={(values) => updateParams((draft) => { draft.sfxEffects = values; })} assets={assets} onCreateAssets={onCreateAssets} timing="event" />}
+    {track.kind === "attribute" && <AttributeEffects title="属性效果" values={params.attributeEffects || []} onChange={(values) => updateParams((draft) => { draft.attributeEffects = values; })} propertyCatalog={propertyCatalog} propertyCatalogMessage={propertyCatalogMessage} nested={false} />}
     {track.kind === "speed" && <div className="field-grid two-columns">
       <NumberField label="施法速度倍率" title="影响当前动作动画播放速度和动作时间轴推进速度" value={numeric(params.castSpeedMultiplier, 1)} min={0.01} step={0.05} onChange={(value) => updateParams((draft) => { draft.castSpeedMultiplier = value; })} />
       <NumberField label="运动速度倍率" title="提供给角色移动代码，影响走跑、空中移动、下落等运动速度，不改变当前动作时间轴" value={numeric(params.movementSpeedMultiplier, 1)} min={0} step={0.05} onChange={(value) => updateParams((draft) => { draft.movementSpeedMultiplier = value; })} />

@@ -109,6 +109,7 @@ export const TRACK_META: Record<TrackKind, { label: string; color: string }> = {
   physics: { label: "物理", color: "#2d7f9d" },
   vfx: { label: "特效", color: "#c17a16" },
   sfx: { label: "音效", color: "#43845a" },
+  attribute: { label: "属性", color: "#8a62b4" },
   speed: { label: "速度", color: "#8a5b3d" },
   camera: { label: "镜头", color: "#4c6992" },
 };
@@ -139,7 +140,7 @@ export function createSegment(name = "主动作", actionType: CharacterAction["t
     jumpHeight: 2.4,
     frames: [],
     markers: [],
-    tracks: (["damage", "physics", "vfx", "sfx", "speed", "camera"] as TrackKind[]).map(createTrack),
+    tracks: (["damage", "physics", "vfx", "sfx", "attribute", "speed", "camera"] as TrackKind[]).map(createTrack),
   };
 }
 
@@ -217,7 +218,7 @@ export function createProject(): CharacterProject {
   hurt.transitions = { "drop-through": "ignore" };
   return {
     format: "frame-action-project",
-    version: 11,
+    version: 12,
     projectKind: "character",
     tickRate: 600,
     characterName: "新角色",
@@ -260,7 +261,7 @@ export function createEnemyProject(): CharacterProject {
   cameraFollow.enabled = false;
   return {
     format: "frame-action-project",
-    version: 11,
+    version: 12,
     projectKind: "enemy",
     tickRate: 600,
     characterName: "新敌人",
@@ -436,6 +437,7 @@ export function createTimelineEvent(kind: TrackKind, startTick: number, pixelsPe
         physicalInheritCasterVelocity: false,
         physicalIgnoreCasterTicks: 30,
         onHitDamageEffects: [{ delayTicks: 0, damageMultiplier: 1, fixedDamage: 0 }],
+        onHitAttributeEffects: [],
         hitStop: { durationTicks: 0, timeScale: 0, pauseCamera: false },
         onHitPhysicsEffects: [],
         companionVfxEffects: [],
@@ -455,6 +457,19 @@ export function createTimelineEvent(kind: TrackKind, startTick: number, pixelsPe
     base.name = "音效事件";
     base.type = "sfx";
     base.params = { sfxEffects: [{ assetId: "", anchor: "caster", x: 0, y: 0, triggerDelayTicks: 0, loop: false, destroyMode: "natural", durationTicks: 0 }] };
+  } else if (kind === "attribute") {
+    base.name = "属性事件";
+    base.type = "attribute";
+    base.params = {
+      attributeEffects: [{
+        id: uid("attribute"),
+        propertyId: "",
+        fixedValue: 0,
+        references: [],
+        changeType: "permanent",
+        durationSeconds: 0,
+      }],
+    };
   } else if (kind === "speed") {
     base.name = "速度事件";
     base.type = "speed";
@@ -561,6 +576,10 @@ export function timelineEventDisplayDuration(
     for (const effect of event.params.vfxEffects || []) tail = Math.max(tail, vfxLifetime(effect, remainingTicks, tickRate));
   } else if (kind === "sfx") {
     for (const effect of event.params.sfxEffects || []) tail = Math.max(tail, sfxLifetime(effect, remainingTicks, tickRate, assets));
+  } else if (kind === "attribute") {
+    for (const effect of event.params.attributeEffects || []) {
+      if (effect?.changeType === "temporary") tail = Math.max(tail, Math.max(0, Number(effect.durationSeconds) || 0) * tickRate);
+    }
   }
   return Math.max(0, repeatedDuration, lastTriggerOffset + tail);
 }

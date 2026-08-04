@@ -7,6 +7,5 @@ namespace FrameAction
         public string objectId;
         public string assetId;
         public string layerName;
-        public string outlinePrecision;
     }
 }

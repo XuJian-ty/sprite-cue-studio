@@ -91,6 +91,22 @@ export function validateProject(project: CharacterProject, assets: Record<string
     if (loop && effect?.destroyMode === "timed" && number(effect?.durationTicks) <= 0) add("error", `${label}指定时长必须大于 0`, location);
   };
 
+  const validateAttributeEffects = (effects: any[], label: string, location: IssueLocation, nested: boolean) => {
+    effects.forEach((effect: any, index: number) => {
+      const effectLabel = `${label} ${index + 1}`;
+      if (!String(effect?.propertyId || "").trim()) add("error", `${effectLabel}未选择目标属性`, location);
+      if (!["temporary", "permanent"].includes(effect?.changeType)) add("error", `${effectLabel}的改变方式无效`, location);
+      if (effect?.changeType === "temporary" && number(effect?.durationSeconds) <= 0) add("error", `${effectLabel}的持续时间必须大于 0`, location);
+      if (nested && !["self", "target"].includes(effect?.targetObject)) add("error", `${effectLabel}的作用对象无效`, location);
+      (effect?.references || []).forEach((reference: any, referenceIndex: number) => {
+        const referenceLabel = `${effectLabel}参考属性 ${referenceIndex + 1}`;
+        if (!String(reference?.propertyId || "").trim()) add("error", `${referenceLabel}未选择属性`, location);
+        if (!Number.isFinite(Number(reference?.percent))) add("error", `${referenceLabel}的百分比无效`, location);
+        if (nested && !["self", "target"].includes(reference?.referenceObject)) add("error", `${referenceLabel}的参考对象无效`, location);
+      });
+    });
+  };
+
   const validateEvent = (event: TimelineEvent, kind: TrackKind, location: IssueLocation) => {
     if (!event.name.trim()) add("warning", "事件标识为空", location);
     if (!event.id.trim()) add("error", "事件 ID 为空", location);
@@ -155,6 +171,7 @@ export function validateProject(project: CharacterProject, assets: Record<string
         (effect.companionVfxEffects || []).forEach((cue: any, cueIndex: number) => validateVfx(cue, `${label}伴随特效 ${cueIndex + 1}`, location));
         (effect.onHitVfxEffects || []).forEach((cue: any, cueIndex: number) => validateVfx(cue, `${label}命中特效 ${cueIndex + 1}`, location, true));
         (effect.onHitSfxEffects || []).forEach((cue: any, cueIndex: number) => validateSfx(cue, `${label}命中音效 ${cueIndex + 1}`, location, true));
+        validateAttributeEffects(effect.onHitAttributeEffects || [], `${label}命中属性事件`, location, true);
       });
     } else if (kind === "physics") {
       const effects = event.params.physicsEffects || [];
@@ -170,6 +187,10 @@ export function validateProject(project: CharacterProject, assets: Record<string
       const effects = event.params.sfxEffects || [];
       if (!effects.length) add("warning", "音效事件没有音效", location);
       effects.forEach((effect: any, index: number) => validateSfx(effect, `音效 ${index + 1}`, location));
+    } else if (kind === "attribute") {
+      const effects = event.params.attributeEffects || [];
+      if (!effects.length) add("warning", "属性事件没有属性效果", location);
+      validateAttributeEffects(effects, "属性效果", location, false);
     } else if (kind === "camera" && event.params.positionMode === "bezier") {
       validateCurve(event.params.pathProgressCurve, "镜头路径曲线", location);
     }

@@ -1413,6 +1413,10 @@ body.resizing-row * {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.field-grid.three-columns {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
 .field-grid .field {
   margin-bottom: 0;
 }
@@ -1879,6 +1883,21 @@ body.resizing-row * {
   margin-bottom: 0;
 }
 
+.attribute-reference-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr)) 26px;
+  align-items: end;
+  gap: 6px;
+  padding: 7px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #f8f8f5;
+}
+
+.attribute-reference-row .field {
+  margin-bottom: 0;
+}
+
 .progress-curve-editor {
   margin-top: 8px;
   padding: 7px;
@@ -2149,7 +2168,7 @@ body.resizing-row * {
 
 .map-workspace {
   display: grid;
-  grid-template-rows: 48px minmax(0, 1fr) 26px;
+  grid-template-rows: auto minmax(0, 1fr) 26px;
   min-width: 0;
   min-height: 0;
   background: #d8d9d5;
@@ -2159,6 +2178,7 @@ body.resizing-row * {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 9px;
   min-width: 0;
   padding: 7px 9px;
@@ -2224,7 +2244,66 @@ body.resizing-row * {
 .map-tool-options {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 5px;
+}
+
+.map-rigid-settings {
+  position: relative;
+  align-self: stretch;
+  min-height: 29px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: #fff;
+}
+
+.map-rigid-settings > summary {
+  cursor: pointer;
+  min-width: 58px;
+  padding: 7px 9px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  list-style-position: inside;
+}
+
+.map-rigid-settings[open] {
+  flex-basis: 100%;
+}
+
+.map-rigid-settings > div {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 0 8px 8px;
+}
+
+.map-rigid-settings-note {
+  flex: 1 0 100%;
+  margin: 0 0 3px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: #f2f8fb;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.map-ice-reroll {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 29px;
+  padding: 0 7px;
+  border: 1px solid rgba(70, 178, 214, 0.52);
+  border-radius: 4px;
+  color: #176f91;
+  background: #eefbff;
+  cursor: pointer;
+  font-size: 10px;
+  white-space: nowrap;
 }
 
 .map-collision-swatch {
@@ -2339,6 +2418,49 @@ body.resizing-row * {
   white-space: nowrap;
 }
 
+.map-ice-authoring-hint {
+  position: absolute;
+  z-index: 4;
+  top: 10px;
+  left: 50%;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 2px 7px;
+  max-width: min(620px, calc(100% - 28px));
+  padding: 7px 10px;
+  border: 1px solid rgba(73, 190, 223, 0.62);
+  border-radius: 6px;
+  color: #155f7d;
+  background: rgba(239, 252, 255, 0.94);
+  box-shadow: 0 3px 12px rgba(20, 76, 96, 0.14);
+  transform: translateX(-50%);
+  pointer-events: none;
+  font-size: 10px;
+}
+
+.map-ice-authoring-hint svg {
+  grid-row: 1 / 3;
+}
+
+.map-ice-authoring-hint span,
+.map-ice-authoring-hint small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.map-ice-authoring-hint small {
+  color: rgba(21, 95, 125, 0.72);
+  font-size: 9px;
+}
+
+.map-ice-authoring-hint.error {
+  border-color: rgba(220, 72, 64, 0.64);
+  color: #a62d28;
+  background: rgba(255, 242, 241, 0.95);
+}
+
 .map-canvas-status {
   display: flex;
   align-items: center;
@@ -2357,6 +2479,108 @@ body.resizing-row * {
   align-items: center;
   gap: 9px;
   margin-bottom: 10px;
+}
+
+.map-selection-summary {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 9px;
+}
+
+.map-selection-summary > div {
+  display: flex;
+  overflow: hidden;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.map-selection-summary strong {
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.map-selection-summary span {
+  color: var(--text-muted);
+  font-size: 9px;
+}
+
+.map-selection-icon {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: #fff;
+}
+
+.map-selection-meta {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 8px;
+  margin: 7px 0;
+  padding: 7px 0;
+  border-block: 1px solid #e2e2dc;
+  font-size: 9px;
+}
+
+.map-selection-meta span {
+  color: var(--text-muted);
+}
+
+.map-selection-edit-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  width: 100%;
+  min-height: 31px;
+  border: 1px solid rgba(22, 129, 120, 0.5);
+  border-radius: 4px;
+  color: var(--teal);
+  background: #fff;
+  cursor: pointer;
+  font-size: 10px;
+}
+
+.map-selection-edit-button:hover {
+  color: #fff;
+  background: var(--teal);
+}
+
+.map-object-inspector .checkbox-field {
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+}
+
+.map-object-inspector .checkbox-field input {
+  width: 15px;
+  min-height: 15px;
+  margin: 0;
+  accent-color: var(--teal);
+}
+
+.map-selection-details {
+  margin-top: 8px;
+  border-top: 1px solid #e2e2dc;
+}
+
+.map-selection-details > summary {
+  padding: 8px 0 6px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.map-selection-details .field input[type="color"] {
+  min-height: 30px;
+  padding: 2px;
 }
 
 .map-asset-template-help {
@@ -2442,12 +2666,23 @@ body.resizing-row * {
 
 .map-outline-item {
   display: grid;
-  grid-template-columns: 16px minmax(0, 1fr) 25px;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
   align-items: center;
   gap: 5px;
   min-height: 34px;
   padding: 3px 4px;
   border-bottom: 1px solid #e2e2dc;
+  cursor: pointer;
+}
+
+.map-outline-item:hover {
+  background: rgba(22, 129, 120, 0.05);
+}
+
+.map-outline-item.selected {
+  border-bottom-color: rgba(240, 165, 29, 0.5);
+  background: rgba(240, 165, 29, 0.12);
+  box-shadow: inset 3px 0 0 #f0a51d;
 }
 
 .map-outline-item button {
@@ -2464,6 +2699,20 @@ body.resizing-row * {
 .map-outline-item button:hover {
   color: #b8402d;
   background: #f5e6e2;
+}
+
+.map-outline-item-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.map-outline-item-actions .map-outline-convert-ice {
+  color: #167b9c;
+}
+
+.map-outline-item-actions .map-outline-convert-ice:hover {
+  color: #fff;
+  background: #2c9fc4;
 }
 
 .map-outline-item.draft {

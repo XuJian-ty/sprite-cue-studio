@@ -1,4 +1,12 @@
-export type TrackKind = "damage" | "physics" | "vfx" | "sfx" | "speed" | "camera";
+export type TrackKind = "damage" | "physics" | "vfx" | "sfx" | "attribute" | "speed" | "camera";
+
+export interface UnityPropertyCatalogEntry {
+  id: string;
+  displayName: string;
+  category: string;
+  allowTemporary: boolean;
+  allowPermanent: boolean;
+}
 
 export interface AssetRef {
   id: string;
@@ -196,7 +204,7 @@ export interface EnemyBehaviorNode {
 
 export interface CharacterProject {
   format: "frame-action-project";
-  version: 11;
+  version: 12;
   projectKind: "character" | "enemy";
   tickRate: number;
   characterName: string;

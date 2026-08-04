@@ -17,6 +17,7 @@ import {
   Plus,
   Redo2,
   RotateCcw,
+  Snowflake,
   Trash2,
   TriangleAlert,
   Unlink,
@@ -31,7 +32,9 @@ import NumericInput from "./NumericInput";
 import { loadMapDraft, saveMapDraft } from "../mapDraftStore";
 import { readDocumentOrigin, rememberLocalDocument, rememberUnityDocument } from "../workspaceSession";
 import { createGroundLinePoints, finishBrushDrawing, pointDistance } from "../mapGeometry";
-import { createMapProject, type MapAssetRef, type MapLayer, type MapMode, type MapObjectData, type MapObjectMotionData, type MapOutlineData, type MapPoint, type MapProject, type OutlinePrecision } from "../mapTypes";
+import { buildProceduralRigidBody, buildIceFracturePreview, DEFAULT_PROCEDURAL_RIGID_FRACTURE, DEFAULT_PROCEDURAL_RIGID_VISUAL, ensureProgramRigidAssetOutline, ensureProgramRigidAssets, ensureProgramRigidOutline, ensureProgramRigidProject, pointInPolygon, PROCEDURAL_RIGID_TEMPLATES, type ProceduralRigidBuildResult, type IceFracturePreviewResult, type ProceduralRigidTerrainContour, type ProceduralRigidTerrainRoutePreference } from "../mapIceGeometry";
+import { createMatterProfile, normalizeMatterProfile } from "../mapMatterProfiles";
+import { createMapProject, type IceBodyClosureMode, type MapAssetRef, type MapElement, type MapLayer, type MapMatterAuthoringProfileData, type MapMatterStrokeData, type MapMode, type MapObjectData, type MapObjectMotionData, type MapOutlineData, type MapPoint, type MapProject, type ProceduralRigidFractureAuthoringData, type ProceduralRigidPhysicalAuthoringData, type ProceduralRigidTemplateId, type ProceduralRigidVisualAuthoringData } from "../mapTypes";
 import { uid } from "../model";
 
 interface MapEditorProps {
@@ -72,7 +75,7 @@ interface ViewState {
 }
 
 interface PointerOperation {
-  type: "pan" | "drag" | "draw";
+  type: "pan" | "drag" | "draw" | "matter";
   pointerId: number;
   startClientX: number;
   startClientY: number;
@@ -82,7 +85,10 @@ interface PointerOperation {
   offsetX?: number;
   offsetY?: number;
   historyRecorded?: boolean;
+  drawMode?: MapMode;
 }
+
+type CanvasSelectionKind = "object" | "outline" | "matter";
 
 interface MapSnapshot {
   project: MapProject;
@@ -98,8 +104,15 @@ interface PendingBackgroundReplacement {
   asset: MapAssetRef;
 }
 
-const layerLabels: Record<MapLayer, string> = { decoration: "装饰层", collision: "地面/碰撞层", occlusion: "遮挡层" };
-const layerColors: Record<MapLayer, string> = { decoration: "#168178", collision: "#d15343", occlusion: "#4767ad" };
+interface IceFracturePreviewTarget {
+  outlineId: string;
+  impactPoint: MapPoint;
+}
+
+const layerLabels: Record<MapLayer, string> = { decoration: "装饰层", collision: "地面/碰撞层", rigid: "程序刚体层", occlusion: "遮挡层" };
+const layerColors: Record<MapLayer, string> = { decoration: "#168178", collision: "#d15343", rigid: "#9a4fd1", occlusion: "#4767ad" };
+const elementLabels: Record<MapElement, string> = { fire: "火", ice: "冰", water: "水", wind: "风", light: "光", dark: "暗", thunder: "雷" };
+const elementColors: Record<MapElement, string> = { fire: "#ff542c", ice: "#65cdf2", water: "#287bd8", wind: "#7be1ba", light: "#ffe174", dark: "#5a2d82", thunder: "#ad68ff" };
 const rectangleCollisionColors = {
   "solid-sides": { stroke: "#d15343", fill: "rgba(209,83,67,.18)" },
   "solid-open": { stroke: "#cc8618", fill: "rgba(204,134,24,.18)" },
@@ -108,8 +121,77 @@ const rectangleCollisionColors = {
 } as const;
 const HORIZONTAL_SNAP_SCREEN_PX = 10;
 const MAP_ASSET_BASE64_CHUNK_SIZE = 8 * 1024 * 1024;
-const precisionLabels: Record<OutlinePrecision, string> = { low: "低", medium: "中", high: "高", ultra: "极高" };
 
+function previewNoise(seed: number, key: number): number {
+  let value = ((seed >>> 0) ^ Math.imul(key | 0, 0x9e3779b1)) >>> 0;
+  value ^= value >>> 16;
+  value = Math.imul(value, 0x7feb352d) >>> 0;
+  value ^= value >>> 15;
+  return (value >>> 0) / 0x100000000;
+}
+
+function colorWithAlpha(hex: string, alpha: number): string {
+  const match = /^#([0-9a-f]{6})$/i.exec(hex);
+  if (!match) return `rgba(255,255,255,${Math.max(0, Math.min(1, alpha))})`;
+  const value = Number.parseInt(match[1], 16);
+  return `rgba(${value >> 16},${value >> 8 & 255},${value & 255},${Math.max(0, Math.min(1, alpha))})`;
+}
+
+function mixHexColor(first: string, second: string, amount: number): string {
+  const parse = (value: string) => Number.parseInt(value.replace("#", ""), 16);
+  const a = parse(first);
+  const b = parse(second);
+  const t = Math.max(0, Math.min(1, amount));
+  const channel = (shift: number) => Math.round(((a >> shift) & 255) * (1 - t) + ((b >> shift) & 255) * t);
+  return `rgb(${channel(16)},${channel(8)},${channel(0)})`;
+}
+
+function collisionOutlineContours(outline: MapOutlineData, sourceId: string, points = outline.points, sourceKind: ProceduralRigidTerrainContour["sourceKind"] = "mapOutline"): ProceduralRigidTerrainContour[] {
+  if (outline.layer !== "collision" || outline.collisionType !== "solid" || points.length < 2) return [];
+  if (outline.shape !== "groundLine") {
+    return points.length >= 3 ? [{ id: sourceId, sourceKind, points, closed: outline.closed !== false }] : [];
+  }
+  if (points.length < 4) return [];
+  if (outline.sideCollision !== false) return [{ id: sourceId, sourceKind, points: points.slice(0, 4), closed: true }];
+  return [
+    { id: `${sourceId}:top`, sourceKind, points: [points[0], points[1]], closed: false },
+    { id: `${sourceId}:bottom`, sourceKind, points: [points[3], points[2]], closed: false },
+  ];
+}
+
+function transformAssetOutlinePoint(point: MapPoint, object: MapObjectData, asset: MapAssetRef): MapPoint {
+  const width = asset.width * object.scale;
+  const height = asset.height * object.scale;
+  const localX = (point.x - asset.width * 0.5) * object.scale;
+  const localY = (point.y - asset.height * 0.5) * object.scale;
+  const radians = object.rotation * Math.PI / 180;
+  const cosine = Math.cos(radians);
+  const sine = Math.sin(radians);
+  return {
+    x: object.x + width * 0.5 + localX * cosine - localY * sine,
+    y: object.y + height * 0.5 + localX * sine + localY * cosine,
+  };
+}
+
+function collectIceTerrainContours(project: MapProject, assets: Record<string, MapAssetRef>): ProceduralRigidTerrainContour[] {
+  const contours = project.outlines.flatMap((outline) => collisionOutlineContours(outline, outline.id));
+  for (const object of project.objects) {
+    if (object.layer !== "collision" || object.mode === "dynamic") continue;
+    const asset = assets[object.assetId];
+    if (!asset) continue;
+    for (const outline of asset.outlines || []) {
+      const points = outline.points.map((point) => transformAssetOutlinePoint(point, object, asset));
+      contours.push(...collisionOutlineContours(outline, `${object.id}:${outline.id}`, points, "assetOutline"));
+    }
+  }
+  return contours;
+}
+
+function averagePoint(points: MapPoint[]): MapPoint {
+  if (!points.length) return { x: 0, y: 0 };
+  const sum = points.reduce((value, point) => ({ x: value.x + point.x, y: value.y + point.y }), { x: 0, y: 0 });
+  return { x: sum.x / points.length, y: sum.y / points.length };
+}
 function normalizeMapOutline(outline: MapOutlineData): MapOutlineData {
   const legacyLineRoad = String(outline.shape) === "lineRoad" || String(outline.shape) === "oneWayLine";
   const rectangleCollision = legacyLineRoad || String(outline.shape) === "groundLine";
@@ -119,6 +201,8 @@ function normalizeMapOutline(outline: MapOutlineData): MapOutlineData {
   const end = sourcePoints[sourcePoints.length - 1];
   return {
     ...outline,
+    layer: String(outline.layer) === "rigid" ? "rigid" : String(outline.layer) === "occlusion" ? "occlusion" : "collision",
+    element: elementLabels[outline.element] ? outline.element : "fire",
     shape: legacyLineRoad ? "groundLine" : outline.shape,
     thickness,
     sideCollision: legacyLineRoad ? false : outline.sideCollision !== false,
@@ -130,15 +214,22 @@ function normalizeMapAsset(asset: MapAssetRef): MapAssetRef {
   return {
     ...asset,
     url: asset.dataUrl || asset.url,
-    outlines: (asset.outlines || []).map(normalizeMapOutline),
-    draftOutlines: (asset.draftOutlines || []).map(normalizeMapOutline),
+    outlines: (asset.outlines || []).map(normalizeMapOutline).map(ensureProgramRigidAssetOutline),
+    draftOutlines: (asset.draftOutlines || []).map(normalizeMapOutline).map(ensureProgramRigidAssetOutline),
   };
 }
 
 function normalizeMapObject(object: MapObjectData): MapObjectData {
   const motion = object.motion || {} as MapObjectMotionData;
+  const normalized = { ...object } as MapObjectData & { outlinePrecision?: unknown };
+  // v2 maps may still contain the retired selector. Discard it during load so the
+  // next save exports one deterministic ArcaneMatter contour policy.
+  delete normalized.outlinePrecision;
   return {
-    ...object,
+    ...normalized,
+    layer: (["decoration", "collision", "rigid", "occlusion"] as string[]).includes(object.layer) ? object.layer : "decoration",
+    elementTag: String(object.elementTag || (object.element && elementLabels[object.element] ? object.element : "fire")).trim() || "fire",
+    element: undefined,
     mode: object.mode === "dynamic" ? "dynamic" : "static",
     collisionType: object.collisionType === "solid" ? "solid" : "oneWay",
     motion: {
@@ -150,6 +241,21 @@ function normalizeMapObject(object: MapObjectData): MapObjectData {
       endpointPauseSeconds: Math.max(0, Number(motion.endpointPauseSeconds) || 0),
       phaseSeconds: Math.max(0, Number(motion.phaseSeconds) || 0),
     },
+  };
+}
+
+function normalizeMatterStroke(stroke: MapMatterStrokeData): MapMatterStrokeData {
+  const carrier = stroke.carrier === "gas" ? "gas" : "liquid";
+  const legacyElement = stroke.element && elementLabels[stroke.element] ? stroke.element : "water";
+  const elementTag = String(stroke.elementTag || legacyElement).trim() || legacyElement;
+  return {
+    ...stroke,
+    carrier,
+    elementTag,
+    element: undefined,
+    profile: normalizeMatterProfile(carrier, elementTag, stroke.profile),
+    radius: Math.max(1, Number(stroke.radius) || 12),
+    points: (stroke.points || []).map((point) => ({ x: Number(point.x) || 0, y: Number(point.y) || 0 })),
   };
 }
 
@@ -195,6 +301,73 @@ function rectangleCollisionLabel(collisionType: MapOutlineData["collisionType"],
   return `${collisionType === "oneWay" ? "单向" : "双向"} · ${sideCollision ? "侧面碰撞" : "侧面穿透"}`;
 }
 
+function distanceToSegment(point: MapPoint, start: MapPoint, end: MapPoint): number {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const lengthSquared = dx * dx + dy * dy;
+  if (lengthSquared <= 0.000001) return pointDistance(point, start);
+  const progress = Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared));
+  return Math.hypot(point.x - (start.x + dx * progress), point.y - (start.y + dy * progress));
+}
+
+function pointNearPath(point: MapPoint, points: MapPoint[], tolerance: number, closed = false): boolean {
+  if (!points.length) return false;
+  if (points.length === 1) return pointDistance(point, points[0]) <= tolerance;
+  for (let index = 1; index < points.length; index += 1) {
+    if (distanceToSegment(point, points[index - 1], points[index]) <= tolerance) return true;
+  }
+  return closed && distanceToSegment(point, points[points.length - 1], points[0]) <= tolerance;
+}
+
+function outlineContainsPoint(outline: MapOutlineData, point: MapPoint, tolerance: number): boolean {
+  if (outline.points.length >= 3 && outline.closed && pointInPolygon(point, outline.points)) return true;
+  return pointNearPath(point, outline.points, tolerance, outline.closed);
+}
+
+function matterStrokeContainsPoint(stroke: MapMatterStrokeData, point: MapPoint, tolerance: number): boolean {
+  return pointNearPath(point, stroke.points, Math.max(1, stroke.radius) + tolerance);
+}
+
+function pointsBounds(points: MapPoint[]): { left: number; top: number; right: number; bottom: number; centerX: number; centerY: number } {
+  if (!points.length) return { left: 0, top: 0, right: 0, bottom: 0, centerX: 0, centerY: 0 };
+  const bounds = points.reduce((current, point) => ({
+    left: Math.min(current.left, point.x),
+    top: Math.min(current.top, point.y),
+    right: Math.max(current.right, point.x),
+    bottom: Math.max(current.bottom, point.y),
+  }), { left: points[0].x, top: points[0].y, right: points[0].x, bottom: points[0].y });
+  return { ...bounds, centerX: (bounds.left + bounds.right) * 0.5, centerY: (bounds.top + bounds.bottom) * 0.5 };
+}
+
+function translateOutline(outline: MapOutlineData, offsetX: number, offsetY: number): MapOutlineData {
+  const move = (point: MapPoint): MapPoint => ({ x: point.x + offsetX, y: point.y + offsetY });
+  if (!outline.rigidBody) return { ...outline, points: outline.points.map(move) };
+  const rigidBody = outline.rigidBody;
+  return {
+    ...outline,
+    points: outline.points.map(move),
+    rigidBody: {
+      ...rigidBody,
+      ...(rigidBody.authoringPoints ? { authoringPoints: rigidBody.authoringPoints.map(move) } : {}),
+      ...(rigidBody.terrainBinding ? {
+        terrainBinding: {
+          ...rigidBody.terrainBinding,
+          start: move(rigidBody.terrainBinding.start),
+          end: move(rigidBody.terrainBinding.end),
+        },
+      } : {}),
+      facets: rigidBody.facets.map((facet) => ({ ...facet, points: facet.points.map(move) as [MapPoint, MapPoint, MapPoint] })),
+    },
+  };
+}
+
+function selectionOutlineLabel(outline: MapOutlineData): string {
+  if (outline.rigidBody) return `${PROCEDURAL_RIGID_TEMPLATES[outline.rigidBody.templateId].label}程序刚体`;
+  if (outline.layer === "occlusion") return "遮挡区域";
+  if (outline.shape === "groundLine") return "矩形碰撞";
+  return outline.layer === "rigid" ? "程序刚体（待迁移）" : "碰撞区域";
+}
+
 function downloadJson(value: unknown, fileName: string): void {
   const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: "application/json" }));
   const anchor = document.createElement("a");
@@ -225,16 +398,17 @@ function decodeBase64Chunk(value: string): Uint8Array<ArrayBuffer> {
 }
 
 function mapAssetMetadata(asset: MapAssetRef, byteSize = base64ByteSize(base64Payload(asset.dataUrl || asset.url))): Omit<MapAssetRef, "dataUrl" | "url"> & { byteSize: number } {
+  const persistentAsset = ensureProgramRigidAssets({ [asset.id]: asset })[asset.id];
   return {
-    id: asset.id,
-    name: asset.name,
-    kind: asset.kind,
-    usage: asset.usage,
-    defaultLayer: asset.defaultLayer,
-    width: asset.width,
-    height: asset.height,
-    outlines: asset.outlines || [],
-    draftOutlines: asset.draftOutlines || [],
+    id: persistentAsset.id,
+    name: persistentAsset.name,
+    kind: persistentAsset.kind,
+    usage: persistentAsset.usage,
+    defaultLayer: persistentAsset.defaultLayer,
+    width: persistentAsset.width,
+    height: persistentAsset.height,
+    outlines: persistentAsset.outlines || [],
+    draftOutlines: persistentAsset.draftOutlines || [],
     byteSize,
   };
 }
@@ -242,10 +416,36 @@ function mapAssetMetadata(asset: MapAssetRef, byteSize = base64ByteSize(base64Pa
 function scaleProjectForBackground(project: MapProject, asset: MapAssetRef): MapProject {
   const scaleX = asset.width / Math.max(1, project.width);
   const scaleY = asset.height / Math.max(1, project.height);
+  const scaleAverage = (scaleX + scaleY) * 0.5;
+  const scalePoint = (point: MapPoint): MapPoint => ({ x: point.x * scaleX, y: point.y * scaleY });
   const scaleOutline = (outline: MapOutlineData): MapOutlineData => ({
     ...outline,
     thickness: outline.shape === "groundLine" ? Math.max(1, outline.thickness * scaleY) : outline.thickness * scaleY,
-    points: outline.points.map((point) => ({ x: point.x * scaleX, y: point.y * scaleY })),
+    points: outline.points.map(scalePoint),
+    ...(outline.rigidBody ? {
+      rigidBody: {
+        ...outline.rigidBody,
+        ...(outline.rigidBody.authoringPoints ? { authoringPoints: outline.rigidBody.authoringPoints.map(scalePoint) } : {}),
+        edgeRoles: outline.rigidBody.edgeRoles.slice(),
+        ...(outline.rigidBody.terrainBinding ? {
+          terrainBinding: {
+            ...outline.rigidBody.terrainBinding,
+            start: scalePoint(outline.rigidBody.terrainBinding.start),
+            end: scalePoint(outline.rigidBody.terrainBinding.end),
+          },
+        } : {}),
+        ...(outline.rigidBody.authoringPoints ? {
+          authoringPoints: outline.rigidBody.authoringPoints.map(scalePoint),
+        } : {}),
+        visual: { ...outline.rigidBody.visual, facetScale: outline.rigidBody.visual.facetScale * scaleAverage, edgeWidthPixels: outline.rigidBody.visual.edgeWidthPixels * scaleAverage },
+        fracture: {
+          ...outline.rigidBody.fracture,
+          minimumFragmentArea: outline.rigidBody.fracture.minimumFragmentArea * scaleX * scaleY,
+          minimumFragmentWidth: outline.rigidBody.fracture.minimumFragmentWidth * scaleAverage,
+        },
+        facets: outline.rigidBody.facets.map((facet) => ({ ...facet, points: facet.points.map(scalePoint) as [MapPoint, MapPoint, MapPoint] })),
+      },
+    } : {}),
   });
   return {
     ...project,
@@ -261,6 +461,11 @@ function scaleProjectForBackground(project: MapProject, asset: MapAssetRef): Map
     })),
     outlines: project.outlines.map(scaleOutline),
     draftOutlines: project.draftOutlines.map(scaleOutline),
+    matterStrokes: (project.matterStrokes || []).map((stroke) => ({
+      ...stroke,
+      radius: Math.max(1, stroke.radius * (scaleX + scaleY) * 0.5),
+      points: stroke.points.map((point) => ({ x: point.x * scaleX, y: point.y * scaleY })),
+    })),
   };
 }
 
@@ -272,14 +477,54 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
   const [project, setProject] = useState<MapProject>(() => createMapProject());
   const [assets, setAssets] = useState<Record<string, MapAssetRef>>({});
   const [selectedObjectId, setSelectedObjectId] = useState("");
+  const [selectedOutlineId, setSelectedOutlineId] = useState("");
+  const [selectedMatterStrokeId, setSelectedMatterStrokeId] = useState("");
   const [editingAssetId, setEditingAssetId] = useState("");
   const [mode, setMode] = useState<MapMode>("select");
   const [activeLayer, setActiveLayer] = useState<MapLayer>("decoration");
   const [groundThickness, setGroundThickness] = useState(18);
   const [groundCollisionType, setGroundCollisionType] = useState<"solid" | "oneWay">("solid");
   const [groundSideCollision, setGroundSideCollision] = useState(true);
+  const [matterElement, setMatterElement] = useState<MapElement>("water");
+  const [matterElementTag, setMatterElementTag] = useState("water");
+  const [matterProfiles, setMatterProfiles] = useState<Record<"liquid" | "gas", MapMatterAuthoringProfileData>>({
+    liquid: createMatterProfile("liquid", "water"),
+    gas: createMatterProfile("gas", "wind"),
+  });
+  const [matterBrushRadius, setMatterBrushRadius] = useState(14);
+  const [iceClosureMode, setIceClosureMode] = useState<IceBodyClosureMode>("manual");
+  const [rigidTemplateId, setRigidTemplateId] = useState<ProceduralRigidTemplateId>("iceCrystal");
+  const [rigidElementTag, setRigidElementTag] = useState(PROCEDURAL_RIGID_TEMPLATES.iceCrystal.defaultElementTag);
+  const [iceRoutePreference, setIceRoutePreference] = useState<ProceduralRigidTerrainRoutePreference>("shorter");
+  const [iceSeed, setIceSeed] = useState(240731);
+  const [rigidBaseColor, setRigidBaseColor] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.baseColor);
+  const [rigidShadowColor, setRigidShadowColor] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.shadowColor);
+  const [rigidHighlightColor, setRigidHighlightColor] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.highlightColor);
+  const [rigidEdgeColor, setRigidEdgeColor] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.edgeColor);
+  const [rigidFractureColor, setRigidFractureColor] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.fractureColor);
+  const [rigidOpacity, setRigidOpacity] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.opacity);
+  const [iceJaggedness, setIceJaggedness] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.edgeJaggedness);
+  const [iceFacetSize, setIceFacetSize] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.facetScale);
+  const [iceTextureStrength, setIceTextureStrength] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.textureStrength);
+  const [iceVolumeDepth, setIceVolumeDepth] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.volumeDepth);
+  const [iceTransmission, setIceTransmission] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.transmission);
+  const [iceAbsorption, setIceAbsorption] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.absorption);
+  const [iceFrostWidth, setIceFrostWidth] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.edgeWidthPixels);
+  const [iceSpecularStrength, setIceSpecularStrength] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.specularStrength);
+  const [iceInclusionDensity, setIceInclusionDensity] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.inclusionDensity);
+  const [iceMicroCrackDensity, setIceMicroCrackDensity] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.microCrackDensity);
+  const [rigidFacetVariation, setRigidFacetVariation] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.facetVariation);
+  const [rigidEdgeBrightness, setRigidEdgeBrightness] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.edgeBrightness);
+  const [rigidRoughness, setRigidRoughness] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.roughness);
+  const [rigidGrainDirection, setRigidGrainDirection] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.grainDirectionDegrees);
+  const [rigidVisualAnisotropy, setRigidVisualAnisotropy] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.anisotropy);
+  const [iceLightAngleDegrees, setIceLightAngleDegrees] = useState(DEFAULT_PROCEDURAL_RIGID_VISUAL.lightAngleDegrees);
+  const [rigidPhysical, setRigidPhysical] = useState<ProceduralRigidPhysicalAuthoringData>({ ...PROCEDURAL_RIGID_TEMPLATES.iceCrystal.physical });
+  const [rigidFractureParameters, setRigidFractureParameters] = useState<ProceduralRigidFractureAuthoringData>({ ...DEFAULT_PROCEDURAL_RIGID_FRACTURE });
+  const [editingRigidOutlineId, setEditingRigidOutlineId] = useState("");
   const [autoHorizontalSnap, setAutoHorizontalSnap] = useState(false);
   const [drawing, setDrawing] = useState<MapOutlineData | null>(null);
+  const [matterDrawing, setMatterDrawing] = useState<MapMatterStrokeData | null>(null);
   const [dropPreview, setDropPreview] = useState<AssetDropPreview | null>(null);
   const [pendingBackgroundReplacement, setPendingBackgroundReplacement] = useState<PendingBackgroundReplacement | null>(null);
   const [importDropTarget, setImportDropTarget] = useState<"background" | "objects" | null>(null);
@@ -316,6 +561,7 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
   const imageCacheRef = useRef(new Map<string, HTMLImageElement>());
   const pointerRef = useRef<PointerOperation | null>(null);
   const drawingRef = useRef<MapOutlineData | null>(null);
+  const matterDrawingRef = useRef<MapMatterStrokeData | null>(null);
   const draggedAssetIdRef = useRef("");
   const projectRef = useRef(project);
   const assetsRef = useRef(assets);
@@ -332,6 +578,78 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
   const activeDraftOutlines = editingAsset?.draftOutlines ?? project.draftOutlines;
   const selectedObject = project.objects.find((item) => item.id === selectedObjectId) ?? null;
   const selectedObjectAsset = selectedObject ? assets[selectedObject.assetId] : null;
+  const selectedObjectRigidOutline = selectedObjectAsset?.outlines?.find((outline) => outline.layer === "rigid" && outline.rigidBody) ?? null;
+  const selectedOutline = activeOutlines.find((item) => item.id === selectedOutlineId) ?? null;
+  const selectedMatterStroke = !editingAsset
+    ? (project.matterStrokes || []).find((item) => item.id === selectedMatterStrokeId) ?? null
+    : null;
+  const selectedOutlineBounds = selectedOutline ? pointsBounds(selectedOutline.points) : null;
+  const selectedMatterBounds = selectedMatterStroke ? pointsBounds(selectedMatterStroke.points) : null;
+  const selectedCanvasKind: CanvasSelectionKind | null = selectedObject
+    ? "object"
+    : selectedOutline
+      ? "outline"
+      : selectedMatterStroke
+        ? "matter"
+        : null;
+  const iceTerrainContours = useMemo(() => editingAsset ? [] : collectIceTerrainContours(project, assets), [assets, editingAsset, project]);
+  const rigidTemplate = PROCEDURAL_RIGID_TEMPLATES[rigidTemplateId];
+  const matterCarrier = mode === "gas" ? "gas" : "liquid";
+  const activeMatterProfile = matterProfiles[matterCarrier];
+  const patchMatterProfile = (updater: (current: MapMatterAuthoringProfileData) => MapMatterAuthoringProfileData) => {
+    setMatterProfiles((current) => ({ ...current, [matterCarrier]: updater(current[matterCarrier]) }));
+  };
+  const iceVisual = useMemo(() => ({
+    ...rigidTemplate.visual,
+    templateId: rigidTemplateId,
+    sourceMode: editingAsset ? "sourceImage" as const : "procedural" as const,
+    baseColor: rigidBaseColor,
+    shadowColor: rigidShadowColor,
+    highlightColor: rigidHighlightColor,
+    edgeColor: rigidEdgeColor,
+    fractureColor: rigidFractureColor,
+    opacity: rigidOpacity,
+    edgeJaggedness: iceJaggedness,
+    facetScale: iceFacetSize,
+    facetVariation: rigidFacetVariation,
+    textureStrength: iceTextureStrength,
+    edgeBrightness: rigidEdgeBrightness,
+    volumeDepth: iceVolumeDepth,
+    transmission: iceTransmission,
+    absorption: iceAbsorption,
+    roughness: rigidRoughness,
+    edgeWidthPixels: iceFrostWidth,
+    specularStrength: iceSpecularStrength,
+    inclusionDensity: iceInclusionDensity,
+    microCrackDensity: iceMicroCrackDensity,
+    grainDirectionDegrees: rigidGrainDirection,
+    anisotropy: rigidVisualAnisotropy,
+    lightAngleDegrees: iceLightAngleDegrees,
+  }), [editingAsset, iceAbsorption, iceFacetSize, iceFrostWidth, iceInclusionDensity, iceJaggedness, iceLightAngleDegrees, iceMicroCrackDensity, iceSpecularStrength, iceTextureStrength, iceTransmission, iceVolumeDepth, rigidBaseColor, rigidEdgeBrightness, rigidEdgeColor, rigidFacetVariation, rigidFractureColor, rigidGrainDirection, rigidHighlightColor, rigidOpacity, rigidRoughness, rigidShadowColor, rigidTemplate.visual, rigidTemplateId, rigidVisualAnisotropy]);
+  const iceFracture = useMemo(() => ({
+    ...rigidFractureParameters,
+    primaryFragmentMax: Math.max(rigidFractureParameters.primaryFragmentMin, rigidFractureParameters.primaryFragmentMax),
+    crackBranchMax: Math.max(rigidFractureParameters.crackBranchMin, rigidFractureParameters.crackBranchMax),
+    landingCrackEnergy: Math.max(rigidFractureParameters.landingChipEnergy, rigidFractureParameters.landingCrackEnergy),
+    landingBreakEnergy: Math.max(rigidFractureParameters.landingChipEnergy, rigidFractureParameters.landingCrackEnergy, rigidFractureParameters.landingBreakEnergy),
+  }), [rigidFractureParameters]);
+  const icePreview = useMemo<ProceduralRigidBuildResult | null>(() => {
+    if (mode !== "iceBody" || !drawing || drawing.points.length < 3) return null;
+    return buildProceduralRigidBody({
+      id: drawing.id,
+      userPoints: drawing.points,
+      closureMode: editingAsset ? "manual" : iceClosureMode,
+      terrainContours: iceTerrainContours,
+      routePreference: iceRoutePreference,
+      seed: iceSeed,
+      templateId: rigidTemplateId,
+      elementTag: rigidElementTag,
+      visual: iceVisual,
+      physical: { ...rigidPhysical, anchoringMode: editingAsset ? "dynamic" : iceClosureMode === "terrain" ? "terrainAttached" : rigidPhysical.anchoringMode },
+      fracture: iceFracture,
+      snapDistance: 14 / Math.max(0.05, view.zoom),
+    });
+  }, [drawing, editingAsset, iceClosureMode, iceFracture, iceRoutePreference, iceSeed, iceTerrainContours, iceVisual, mode, rigidElementTag, rigidPhysical, rigidTemplateId, view.zoom]);
 
   const updateProject = useCallback((updater: (current: MapProject) => MapProject) => {
     setProject((current) => {
@@ -348,6 +666,25 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
       return next;
     });
   }, []);
+
+  const patchSelectedAssetRigidTag = (elementTag: string) => {
+    if (!selectedObjectAsset || !selectedObjectRigidOutline?.rigidBody) return;
+    recordHistory();
+    updateAssets((current) => {
+      const asset = current[selectedObjectAsset.id];
+      if (!asset) return current;
+      return {
+        ...current,
+        [asset.id]: {
+          ...asset,
+          outlines: (asset.outlines || []).map((outline) => outline.id === selectedObjectRigidOutline.id && outline.rigidBody
+            ? { ...outline, rigidBody: { ...outline.rigidBody, elementTag } }
+            : outline),
+        },
+      };
+    });
+    setStatus("已修改素材程序刚体标签 · 有未同步修改");
+  };
 
   const updateActiveOutlineCollections = useCallback((updater: (outlines: MapOutlineData[], draftOutlines: MapOutlineData[]) => { outlines: MapOutlineData[]; draftOutlines: MapOutlineData[] }) => {
     if (editingAssetId) {
@@ -373,15 +710,28 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
     setHistoryRevision((value) => value + 1);
   }, []);
 
+  const clearCanvasSelection = useCallback(() => {
+    setSelectedObjectId("");
+    setSelectedOutlineId("");
+    setSelectedMatterStrokeId("");
+  }, []);
+
+  const selectCanvasTarget = useCallback((kind: CanvasSelectionKind, id: string) => {
+    setSelectedObjectId(kind === "object" ? id : "");
+    setSelectedOutlineId(kind === "outline" ? id : "");
+    setSelectedMatterStrokeId(kind === "matter" ? id : "");
+  }, []);
+
   const applySnapshot = useCallback((snapshot: MapSnapshot) => {
     projectRef.current = snapshot.project;
     assetsRef.current = snapshot.assets;
     setProject(snapshot.project);
     setAssets(snapshot.assets);
-    setSelectedObjectId("");
+    clearCanvasSelection();
     setDrawing(null);
+    setMatterDrawing(null);
     setDropPreview(null);
-  }, []);
+  }, [clearCanvasSelection]);
 
   const undoMap = useCallback(() => {
     const history = historyRef.current;
@@ -404,25 +754,26 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
   }, [applySnapshot]);
 
   const restoreProject = useCallback((nextProject: MapProject, nextAssets: Record<string, MapAssetRef>, message: string) => {
-    const restoredAssets = Object.fromEntries(Object.entries(nextAssets).map(([id, asset]) => [id, normalizeMapAsset(asset)])) as Record<string, MapAssetRef>;
-    const restoredProject = {
+    const restoredAssets = ensureProgramRigidAssets(Object.fromEntries(Object.entries(nextAssets).map(([id, asset]) => [id, normalizeMapAsset(asset)])) as Record<string, MapAssetRef>);
+    const restoredProject = ensureProgramRigidProject({
       ...createMapProject(),
       ...nextProject,
       version: 2 as const,
       objects: (nextProject.objects || []).map(normalizeMapObject),
-      outlines: (nextProject.outlines || []).map(normalizeMapOutline),
+      outlines: (nextProject.outlines || []).map(normalizeMapOutline).map(ensureProgramRigidOutline),
       draftOutlines: (nextProject.draftOutlines || []).map(normalizeMapOutline),
-    };
+      matterStrokes: (nextProject.matterStrokes || []).map(normalizeMatterStroke),
+    });
     projectRef.current = restoredProject;
     assetsRef.current = restoredAssets;
     setProject(restoredProject);
     setAssets(restoredAssets);
     historyRef.current = { past: [], future: [] };
     setHistoryRevision((value) => value + 1);
-    setSelectedObjectId("");
+    clearCanvasSelection();
     setEditingAssetId("");
     setStatus(message);
-  }, []);
+  }, [clearCanvasSelection]);
 
   useEffect(() => {
     let cancelled = false;
@@ -582,6 +933,46 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
       for (let x = 0; x <= project.width; x += 64) { context.beginPath(); context.moveTo(x, 0); context.lineTo(x, project.height); context.stroke(); }
       for (let y = 0; y <= project.height; y += 64) { context.beginPath(); context.moveTo(0, y); context.lineTo(project.width, y); context.stroke(); }
     }
+    const drawMatterStroke = (stroke: MapMatterStrokeData, draft = false, selected = false) => {
+      if (!stroke.points.length) return;
+      context.save();
+      context.strokeStyle = stroke.profile.visual.baseColor;
+      context.fillStyle = stroke.profile.visual.baseColor;
+      context.globalAlpha = Math.max(0.08, Math.min(1, stroke.profile.visual.opacity)) *
+        (draft ? 0.88 : stroke.carrier === "gas" ? 0.52 : 0.74);
+      context.lineWidth = Math.max(1, stroke.radius * 2);
+      context.lineCap = "round";
+      context.lineJoin = "round";
+      context.setLineDash(stroke.carrier === "gas" ? [Math.max(4, stroke.radius * 1.4), Math.max(3, stroke.radius)] : []);
+      context.beginPath();
+      stroke.points.forEach((point, index) => index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y));
+      if (stroke.points.length === 1) {
+        context.arc(stroke.points[0].x, stroke.points[0].y, stroke.radius, 0, Math.PI * 2);
+        context.fill();
+      } else context.stroke();
+      context.restore();
+      if (selected) {
+        context.save();
+        context.globalAlpha = 1;
+        context.strokeStyle = "#f0a51d";
+        context.lineWidth = 3 / view.zoom;
+        context.lineCap = "round";
+        context.lineJoin = "round";
+        context.setLineDash([8 / view.zoom, 5 / view.zoom]);
+        context.beginPath();
+        if (stroke.points.length === 1) {
+          context.arc(stroke.points[0].x, stroke.points[0].y, stroke.radius + 3 / view.zoom, 0, Math.PI * 2);
+        } else {
+          stroke.points.forEach((point, index) => index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y));
+        }
+        context.stroke();
+        context.restore();
+      }
+    };
+    if (!editingAsset) {
+      (project.matterStrokes || []).forEach((stroke) => drawMatterStroke(stroke, false, stroke.id === selectedMatterStrokeId));
+      if (matterDrawing) drawMatterStroke(matterDrawing, true);
+    }
     if (!editingAsset) for (const object of project.objects) {
       const asset = assets[object.assetId];
       const image = getImage(asset);
@@ -620,7 +1011,7 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
       context.save();
       context.translate(object.x + width / 2, object.y + height / 2);
       context.rotate((object.rotation * Math.PI) / 180);
-      context.globalAlpha = object.layer === "collision" ? 0.65 : object.layer === "occlusion" ? 0.8 : 1;
+      context.globalAlpha = object.layer === "collision" ? 0.65 : object.layer === "rigid" ? 0.82 : object.layer === "occlusion" ? 0.8 : 1;
       context.drawImage(image, -width / 2, -height / 2, width, height);
       context.globalAlpha = 1;
       context.strokeStyle = object.id === selectedObjectId ? "#d49a25" : layerColors[object.layer];
@@ -647,12 +1038,148 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
         context.restore();
       }
     }
+    const drawProgramRigidBody = (outline: MapOutlineData, draft: boolean) => {
+      const rigidBody = outline.rigidBody;
+      if (!rigidBody || outline.points.length < 3) return;
+      const points = outline.points;
+      const bounds = points.reduce((value, point) => ({
+        left: Math.min(value.left, point.x),
+        top: Math.min(value.top, point.y),
+        right: Math.max(value.right, point.x),
+        bottom: Math.max(value.bottom, point.y),
+      }), { left: points[0].x, top: points[0].y, right: points[0].x, bottom: points[0].y });
+      const pathBody = () => {
+        context.beginPath();
+        points.forEach((point, index) => index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y));
+        context.closePath();
+      };
+      context.save();
+      const visual = rigidBody.visual;
+      context.globalAlpha = (draft ? 0.78 : 1) * visual.opacity;
+      const bodyWidth = Math.max(1, bounds.right - bounds.left);
+      const bodyHeight = Math.max(1, bounds.bottom - bounds.top);
+      const bodySpan = Math.max(bodyWidth, bodyHeight);
+      const centerX = (bounds.left + bounds.right) * 0.5;
+      const centerY = (bounds.top + bounds.bottom) * 0.5;
+      const lightRadians = visual.lightAngleDegrees * Math.PI / 180;
+      const lightX = Math.cos(lightRadians);
+      const lightY = Math.sin(lightRadians);
+      pathBody();
+      const bodyGradient = context.createLinearGradient(
+        centerX - lightX * bodySpan * 0.55,
+        centerY - lightY * bodySpan * 0.55,
+        centerX + lightX * bodySpan * 0.55,
+        centerY + lightY * bodySpan * 0.55,
+      );
+      bodyGradient.addColorStop(0, visual.shadowColor);
+      bodyGradient.addColorStop(0.48, visual.baseColor);
+      bodyGradient.addColorStop(1, visual.highlightColor);
+      context.fillStyle = bodyGradient;
+      context.fill();
+      context.save();
+      pathBody();
+      context.clip();
+      for (const facet of rigidBody.facets) {
+        const shade = Math.max(0, Math.min(1, facet.shade));
+        const centroidX = (facet.points[0].x + facet.points[1].x + facet.points[2].x) / 3;
+        const centroidY = (facet.points[0].y + facet.points[1].y + facet.points[2].y) / 3;
+        const pseudoAngle = previewNoise(rigidBody.seed, facet.id * 977 + 31) * Math.PI * 2;
+        const pseudoLight = Math.max(0, Math.cos(pseudoAngle) * lightX + Math.sin(pseudoAngle) * lightY);
+        const facetSpan = Math.max(5, Math.max(
+          Math.hypot(facet.points[1].x - facet.points[0].x, facet.points[1].y - facet.points[0].y),
+          Math.hypot(facet.points[2].x - facet.points[1].x, facet.points[2].y - facet.points[1].y),
+          Math.hypot(facet.points[0].x - facet.points[2].x, facet.points[0].y - facet.points[2].y),
+        ));
+        const facetGradient = context.createLinearGradient(
+          centroidX - lightX * facetSpan * 0.5,
+          centroidY - lightY * facetSpan * 0.5,
+          centroidX + lightX * facetSpan * 0.5,
+          centroidY + lightY * facetSpan * 0.5,
+        );
+        facetGradient.addColorStop(0, mixHexColor(visual.shadowColor, visual.baseColor, 0.22 + shade * 0.42));
+        facetGradient.addColorStop(1, mixHexColor(visual.baseColor, visual.highlightColor, 0.18 + pseudoLight * visual.specularStrength * 0.55));
+        context.fillStyle = facetGradient;
+        context.beginPath();
+        facet.points.forEach((point, index) => index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y));
+        context.closePath();
+        context.fill();
+        context.strokeStyle = colorWithAlpha(visual.highlightColor, 0.08 + visual.textureStrength * 0.2 + pseudoLight * 0.08);
+        context.lineWidth = (0.45 + visual.volumeDepth * 0.35) / view.zoom;
+        context.stroke();
+      }
+      const inclusionCount = Math.min(72, Math.round(bodyWidth * bodyHeight / Math.max(140, visual.facetScale * visual.facetScale) * (1 + visual.inclusionDensity * 5)));
+      for (let index = 0; index < inclusionCount; index += 1) {
+        const x = bounds.left + bodyWidth * previewNoise(rigidBody.seed, 4103 + index * 67);
+        const y = bounds.top + bodyHeight * previewNoise(rigidBody.seed, 8209 + index * 71);
+        const radius = (0.45 + previewNoise(rigidBody.seed, 12011 + index * 53) * 2.2) * (0.5 + visual.inclusionDensity);
+        context.save();
+        context.translate(x, y);
+        context.rotate(previewNoise(rigidBody.seed, 17027 + index * 43) * Math.PI);
+        context.beginPath();
+        context.ellipse(0, 0, radius * 1.8, radius * 0.52, 0, 0, Math.PI * 2);
+        context.fillStyle = index % 3 === 0
+          ? colorWithAlpha(visual.highlightColor, 0.06 + visual.inclusionDensity * 0.2)
+          : colorWithAlpha(visual.shadowColor, 0.035 + visual.inclusionDensity * 0.13);
+        context.fill();
+        context.restore();
+      }
+      const microCrackCount = Math.min(48, Math.round((bodyWidth + bodyHeight) / Math.max(18, visual.facetScale) * visual.microCrackDensity * 5));
+      for (let index = 0; index < microCrackCount; index += 1) {
+        const x = bounds.left + bodyWidth * previewNoise(rigidBody.seed, 23003 + index * 61);
+        const y = bounds.top + bodyHeight * previewNoise(rigidBody.seed, 29009 + index * 79);
+        const direction = previewNoise(rigidBody.seed, 31013 + index * 83) * Math.PI * 2;
+        const length = Math.max(3, visual.facetScale * (0.18 + previewNoise(rigidBody.seed, 37003 + index * 89) * 0.32));
+        const bend = (previewNoise(rigidBody.seed, 41011 + index * 97) - 0.5) * length * 0.42;
+        const dx = Math.cos(direction) * length;
+        const dy = Math.sin(direction) * length;
+        const nx = -Math.sin(direction) * bend;
+        const ny = Math.cos(direction) * bend;
+        context.beginPath();
+        context.moveTo(x, y);
+        context.lineTo(x + dx * 0.48 + nx, y + dy * 0.48 + ny);
+        context.lineTo(x + dx, y + dy);
+        context.strokeStyle = colorWithAlpha(visual.highlightColor, 0.1 + visual.microCrackDensity * 0.34);
+        context.lineWidth = (0.45 + visual.textureStrength * 0.4) / view.zoom;
+        context.stroke();
+      }
+      context.restore();
+      context.setLineDash([]);
+      context.lineCap = "round";
+      context.lineJoin = "round";
+      const signedArea = points.reduce((sum, point, index) => {
+        const next = points[(index + 1) % points.length];
+        return sum + point.x * next.y - next.x * point.y;
+      }, 0);
+      for (let index = 0; index < points.length; index += 1) {
+        const start = points[index];
+        const end = points[(index + 1) % points.length];
+        const attached = rigidBody.edgeRoles[index] === "terrainAttached";
+        const edgeX = end.x - start.x;
+        const edgeY = end.y - start.y;
+        const inverseLength = 1 / Math.max(0.0001, Math.hypot(edgeX, edgeY));
+        const normalX = (signedArea >= 0 ? edgeY : -edgeY) * inverseLength;
+        const normalY = (signedArea >= 0 ? -edgeX : edgeX) * inverseLength;
+        const edgeLight = Math.max(0, normalX * lightX + normalY * lightY);
+        context.beginPath();
+        context.moveTo(start.x, start.y);
+        context.lineTo(end.x, end.y);
+        context.strokeStyle = attached ? "#2ed5b5" : colorWithAlpha(visual.edgeColor, 0.42 + visual.edgeBrightness * 0.32 + edgeLight * 0.25);
+        context.lineWidth = (attached ? 2.1 : Math.max(1.4, visual.edgeWidthPixels * (0.58 + edgeLight * 0.48))) / view.zoom;
+        context.setLineDash(attached ? [6 / view.zoom, 4 / view.zoom] : []);
+        context.stroke();
+      }
+      context.restore();
+    };
     const drawOutline = (outline: MapOutlineData, draft: boolean) => {
       if (outline.points.length < 2) return;
+      if (outline.rigidBody && outline.closed) {
+        drawProgramRigidBody(outline, draft);
+        return;
+      }
       context.save();
       const rectangleStyle = outline.shape === "groundLine" ? rectangleCollisionStyle(outline.collisionType, outline.sideCollision !== false) : null;
-      context.strokeStyle = outline.layer === "occlusion" ? layerColors.occlusion : rectangleStyle?.stroke || layerColors.collision;
-      context.fillStyle = outline.layer === "occlusion" ? "rgba(71,103,173,.15)" : rectangleStyle?.fill || "rgba(209,83,67,.18)";
+      context.strokeStyle = outline.layer === "occlusion" ? layerColors.occlusion : outline.layer === "rigid" ? elementColors[outline.element] : rectangleStyle?.stroke || layerColors.collision;
+      context.fillStyle = outline.layer === "occlusion" ? "rgba(71,103,173,.15)" : outline.layer === "rigid" ? `${elementColors[outline.element]}38` : rectangleStyle?.fill || "rgba(209,83,67,.18)";
       context.lineWidth = (draft ? 3 : 2) / view.zoom;
       context.setLineDash(draft ? [8 / view.zoom, 5 / view.zoom] : []);
       if (outline.shape === "groundLine" && outline.points.length >= 4) {
@@ -692,13 +1219,47 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
     };
     activeOutlines.forEach((outline) => drawOutline(outline, false));
     activeDraftOutlines.forEach((outline) => drawOutline(outline, true));
-    if (drawing) drawOutline(drawing, true);
+    if (selectedOutline) {
+      context.save();
+      context.strokeStyle = "#f0a51d";
+      context.fillStyle = "#fff7df";
+      context.lineWidth = 3 / view.zoom;
+      context.setLineDash([9 / view.zoom, 5 / view.zoom]);
+      context.beginPath();
+      selectedOutline.points.forEach((point, index) => index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y));
+      if (selectedOutline.closed && selectedOutline.points.length > 2) context.closePath();
+      context.stroke();
+      context.setLineDash([]);
+      for (const point of selectedOutline.points) {
+        const size = 5 / view.zoom;
+        context.fillRect(point.x - size * 0.5, point.y - size * 0.5, size, size);
+        context.strokeRect(point.x - size * 0.5, point.y - size * 0.5, size, size);
+      }
+      context.restore();
+    }
+    if (drawing) {
+      if (mode === "iceBody" && icePreview?.ok && icePreview.rigidBody) {
+        drawOutline({ ...drawing, points: icePreview.points, closed: true, rigidBody: icePreview.rigidBody }, true);
+      } else {
+        drawOutline(drawing, true);
+        if (mode === "iceBody" && icePreview && !icePreview.ok) {
+          context.save();
+          context.strokeStyle = "#e64b45";
+          context.lineWidth = 3 / view.zoom;
+          context.setLineDash([7 / view.zoom, 4 / view.zoom]);
+          context.beginPath();
+          drawing.points.forEach((point, index) => index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y));
+          context.stroke();
+          context.restore();
+        }
+      }
+    }
     context.strokeStyle = "#5e6662";
     context.lineWidth = 1 / view.zoom;
     context.setLineDash([]);
     context.strokeRect(0, 0, documentWidth, documentHeight);
     context.restore();
-  }, [activeDraftOutlines, activeOutlines, assets, backgroundAsset, canvasSize, documentHeight, documentWidth, drawing, dropPreview, editingAsset, getImage, imageRevision, project, selectedObjectId, view]);
+  }, [activeDraftOutlines, activeOutlines, assets, backgroundAsset, canvasSize, documentHeight, documentWidth, drawing, dropPreview, editingAsset, getImage, icePreview, imageRevision, matterDrawing, mode, project, selectedMatterStrokeId, selectedObjectId, selectedOutline, view]);
 
   const rawMapPointFromClient = (clientX: number, clientY: number): MapPoint => {
     const rect = canvasRef.current?.getBoundingClientRect();
@@ -733,6 +1294,24 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
     return null;
   };
 
+  const hitActiveOutline = (point: MapPoint): MapOutlineData | null => {
+    const tolerance = 7 / Math.max(0.05, view.zoom);
+    for (let index = activeOutlines.length - 1; index >= 0; index -= 1) {
+      if (outlineContainsPoint(activeOutlines[index], point, tolerance)) return activeOutlines[index];
+    }
+    return null;
+  };
+
+  const hitMatterStroke = (point: MapPoint): MapMatterStrokeData | null => {
+    if (editingAsset) return null;
+    const strokes = project.matterStrokes || [];
+    const tolerance = 5 / Math.max(0.05, view.zoom);
+    for (let index = strokes.length - 1; index >= 0; index -= 1) {
+      if (matterStrokeContainsPoint(strokes[index], point, tolerance)) return strokes[index];
+    }
+    return null;
+  };
+
   const addObject = (asset: MapAssetRef, point: MapPoint) => {
     recordHistory();
     const scale = defaultObjectScale(asset, projectRef.current);
@@ -740,6 +1319,7 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
       id: uid("map_object"),
       assetId: asset.id,
       layer: asset.defaultLayer,
+      elementTag: asset.outlines?.find((outline) => outline.layer === "rigid" && outline.rigidBody)?.rigidBody?.elementTag || rigidElementTag || "untagged",
       mode: "static",
       collisionType: "oneWay",
       motion: { direction: "horizontal", speedMetersPerSecond: 2, rangeMeters: 10, initialProgress: 0, pingPong: true, endpointPauseSeconds: 0, phaseSeconds: 0 },
@@ -748,10 +1328,9 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
       scale,
       rotation: 0,
       z: 0,
-      outlinePrecision: asset.defaultLayer === "occlusion" ? "high" : "medium",
     };
     updateProject((current) => ({ ...current, objects: [...current.objects, object] }));
-    setSelectedObjectId(object.id);
+    selectCanvasTarget("object", object.id);
     setMode("select");
     setStatus("地图有未同步修改");
   };
@@ -767,13 +1346,30 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
     if (event.button !== 0) return;
     const rawPoint = rawMapPointFromClient(event.clientX, event.clientY);
     const point = mapPointFromClient(event.clientX, event.clientY);
-    if (mode === "groundLine" || mode === "collision" || mode === "occlusion") {
+    if (!editingAsset && (mode === "liquid" || mode === "gas")) {
+      if (!isPointInsideMap(rawPoint)) return;
+      const stroke: MapMatterStrokeData = {
+        id: uid("map_matter"),
+        carrier: mode,
+        elementTag: matterElementTag.trim() || "untagged",
+        profile: normalizeMatterProfile(mode, matterElementTag, activeMatterProfile),
+        radius: matterBrushRadius,
+        points: [point],
+      };
+      matterDrawingRef.current = stroke;
+      setMatterDrawing(stroke);
+      pointerRef.current = { type: "matter", pointerId: event.pointerId, startClientX: event.clientX, startClientY: event.clientY };
+      event.currentTarget.setPointerCapture(event.pointerId);
+      return;
+    }
+    if (mode === "groundLine" || mode === "collision" || mode === "rigid" || mode === "iceBody" || mode === "occlusion") {
       if (!isPointInsideMap(rawPoint)) return;
       const outline: MapOutlineData = {
         id: uid("map_outline"),
-        layer: mode === "occlusion" ? "occlusion" : "collision",
+        layer: mode === "occlusion" ? "occlusion" : mode === "rigid" || mode === "iceBody" ? "rigid" : "collision",
+        element: mode === "iceBody" ? "ice" : matterElement,
         shape: mode === "groundLine" ? "groundLine" : "polygon",
-        collisionType: mode === "occlusion" ? "trigger" : mode === "collision" ? "solid" : groundCollisionType,
+        collisionType: mode === "occlusion" ? "trigger" : mode === "groundLine" ? groundCollisionType : "solid",
         sideCollision: mode === "groundLine" ? groundSideCollision : true,
         thickness: mode === "groundLine" ? groundThickness : 0,
         closed: false,
@@ -781,17 +1377,30 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
       };
       drawingRef.current = outline;
       setDrawing(outline);
-      pointerRef.current = { type: "draw", pointerId: event.pointerId, startClientX: event.clientX, startClientY: event.clientY };
+      pointerRef.current = { type: "draw", pointerId: event.pointerId, startClientX: event.clientX, startClientY: event.clientY, drawMode: mode };
       event.currentTarget.setPointerCapture(event.pointerId);
       return;
     }
+    const outline = hitActiveOutline(point);
+    if (outline) {
+      selectCanvasTarget("outline", outline.id);
+      setStatus(`已选中${selectionOutlineLabel(outline)}`);
+      return;
+    }
     const object = hitObject(point);
-    setSelectedObjectId(object?.id || "");
     if (object) {
+      selectCanvasTarget("object", object.id);
       pointerRef.current = { type: "drag", pointerId: event.pointerId, startClientX: event.clientX, startClientY: event.clientY, objectId: object.id, offsetX: point.x - object.x, offsetY: point.y - object.y };
       event.currentTarget.setPointerCapture(event.pointerId);
       return;
     }
+    const matterStroke = hitMatterStroke(point);
+    if (matterStroke) {
+      selectCanvasTarget("matter", matterStroke.id);
+      setStatus(`已选中${matterStroke.carrier === "gas" ? "气体" : "液体"}画笔 · ${matterStroke.elementTag || "无标签"}`);
+      return;
+    }
+    clearCanvasSelection();
     pointerRef.current = { type: "pan", pointerId: event.pointerId, startClientX: event.clientX, startClientY: event.clientY, startPanX: view.panX, startPanY: view.panY };
     setIsPanning(true);
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -830,6 +1439,16 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
         return next;
       });
     }
+    if (operation.type === "matter") {
+      setMatterDrawing((current) => {
+        if (!current) return current;
+        const last = current.points[current.points.length - 1];
+        if (pointDistance(last, point) < Math.max(2, matterBrushRadius * 0.22) / view.zoom) return current;
+        const next = { ...current, points: [...current.points, point] };
+        matterDrawingRef.current = next;
+        return next;
+      });
+    }
   };
 
   const endPointer = (event: React.PointerEvent<HTMLCanvasElement>) => {
@@ -841,24 +1460,75 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
       setIsPanning(false);
       return;
     }
+    if (operation.type === "matter") {
+      const finishedMatter = matterDrawingRef.current;
+      if (finishedMatter?.points.length) {
+        recordHistory();
+        updateProject((current) => ({ ...current, matterStrokes: [...(current.matterStrokes || []), finishedMatter] }));
+        selectCanvasTarget("matter", finishedMatter.id);
+        setStatus("元素物质画笔有未同步修改");
+      }
+      matterDrawingRef.current = null;
+      setMatterDrawing(null);
+      return;
+    }
     const finishedDrawing = drawingRef.current;
     if (operation.type !== "draw" || !finishedDrawing) return;
     const outlineSource = editingAssetId ? assetsRef.current[editingAssetId] : projectRef.current;
     const currentOutlines = outlineSource?.outlines || [];
     const currentDraftOutlines = outlineSource?.draftOutlines || [];
+    if (operation.drawMode === "iceBody") {
+      const result = buildProceduralRigidBody({
+        id: finishedDrawing.id,
+        userPoints: finishedDrawing.points,
+        closureMode: editingAssetId ? "manual" : iceClosureMode,
+        terrainContours: iceTerrainContours,
+        routePreference: iceRoutePreference,
+        seed: iceSeed,
+        templateId: rigidTemplateId,
+        elementTag: rigidElementTag,
+        visual: iceVisual,
+        physical: { ...rigidPhysical, anchoringMode: editingAssetId ? "dynamic" : iceClosureMode === "terrain" ? "terrainAttached" : rigidPhysical.anchoringMode },
+        fracture: iceFracture,
+        snapDistance: 14 / Math.max(0.05, view.zoom),
+      });
+      if (result.ok && result.rigidBody) {
+        const existingRigid = currentOutlines.filter((outline) => outline.layer === "rigid");
+        if (editingAssetId && existingRigid.length > 0) {
+          setStatus("物体素材的程序刚体只支持一个闭合轮廓；请先删除已有刚体轮廓");
+          drawingRef.current = null;
+          setDrawing(null);
+          return;
+        }
+        recordHistory();
+        const rigidOutline: MapOutlineData = { ...finishedDrawing, layer: "rigid", closed: true, points: result.points, rigidBody: result.rigidBody };
+        updateActiveOutlineCollections((outlines, draftOutlines) => ({ outlines: [...outlines, rigidOutline], draftOutlines }));
+        selectCanvasTarget("outline", rigidOutline.id);
+        setIceSeed((value) => (value + 1) >>> 0 || 1);
+        setStatus(`已创建${PROCEDURAL_RIGID_TEMPLATES[result.rigidBody.templateId].label}程序刚体 · ${result.rigidBody.facets.length} 个分面${result.candidates.length > 1 ? ` · 使用${iceRoutePreference === "alternate" ? "另一侧" : "较短"}地形路径` : ""}`);
+      } else {
+        setStatus(`程序刚体未创建：${result.message}`);
+      }
+      drawingRef.current = null;
+      setDrawing(null);
+      return;
+    }
     if (finishedDrawing.shape === "groundLine") {
       if (pointDistance(finishedDrawing.points[0], finishedDrawing.points[1]) > 3 / view.zoom) {
         recordHistory();
         updateActiveOutlineCollections((outlines, draftOutlines) => ({ outlines: [...outlines, { ...finishedDrawing, closed: true }], draftOutlines }));
+        selectCanvasTarget("outline", finishedDrawing.id);
       }
     } else if (finishedDrawing.points.length >= 2) {
       const result = finishBrushDrawing(finishedDrawing, currentDraftOutlines);
+      const completedOutline = result.outline ? (editingAssetId ? ensureProgramRigidAssetOutline(result.outline) : ensureProgramRigidOutline(result.outline)) : result.outline;
       if (result.outline || result.draftOutlines !== currentDraftOutlines) {
         recordHistory();
         updateActiveOutlineCollections(() => ({
-          outlines: result.outline ? [...currentOutlines, result.outline] : currentOutlines,
+          outlines: completedOutline ? [...currentOutlines, completedOutline] : currentOutlines,
           draftOutlines: result.draftOutlines,
         }));
+        if (completedOutline) selectCanvasTarget("outline", completedOutline.id);
       }
     }
     drawingRef.current = null;
@@ -920,11 +1590,13 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
 
   const exportMapBundle = () => {
     const cleanName = (project.mapName || "地图").replace(/[\\/:*?"<>|]+/g, "_");
+    const persistentProject = ensureProgramRigidProject(project);
+    const persistentAssets = ensureProgramRigidAssets(assets);
     downloadJson({
       format: "frame-action-map-bundle",
       version: 2,
-      project,
-      assets: Object.fromEntries(Object.entries(assets).map(([id, asset]) => [id, { ...asset, url: asset.dataUrl || asset.url }])),
+      project: persistentProject,
+      assets: Object.fromEntries(Object.entries(persistentAssets).map(([id, asset]) => [id, { ...asset, url: asset.dataUrl || asset.url }])),
     }, `${cleanName}.frame-action-map.json`);
     setStatus("已导出完整地图 JSON");
   };
@@ -1014,20 +1686,154 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
     setStatus("地图有未同步修改");
   };
 
+  const patchSelectedOutline = (updater: (outline: MapOutlineData) => MapOutlineData) => {
+    if (!selectedOutlineId) return;
+    recordHistory();
+    updateActiveOutlineCollections((outlines, draftOutlines) => ({
+      outlines: outlines.map((outline) => outline.id === selectedOutlineId ? updater(outline) : outline),
+      draftOutlines,
+    }));
+    setStatus(editingAsset ? "物体模板轮廓有未同步修改" : "地图轮廓有未同步修改");
+  };
+
+  const patchSelectedRigidVisual = (patch: Partial<ProceduralRigidVisualAuthoringData>) => {
+    patchSelectedOutline((outline) => outline.rigidBody ? {
+      ...outline,
+      rigidBody: {
+        ...outline.rigidBody,
+        visual: { ...outline.rigidBody.visual, ...patch },
+      },
+    } : outline);
+  };
+
+  const patchSelectedRigidPhysical = (patch: Partial<ProceduralRigidPhysicalAuthoringData>) => {
+    patchSelectedOutline((outline) => outline.rigidBody ? {
+      ...outline,
+      rigidBody: {
+        ...outline.rigidBody,
+        physical: { ...outline.rigidBody.physical, ...patch },
+      },
+    } : outline);
+  };
+
+  const patchSelectedRigidFracture = (patch: Partial<ProceduralRigidFractureAuthoringData>) => {
+    patchSelectedOutline((outline) => outline.rigidBody ? {
+      ...outline,
+      rigidBody: {
+        ...outline.rigidBody,
+        fracture: { ...outline.rigidBody.fracture, ...patch },
+      },
+    } : outline);
+  };
+
+  const moveSelectedOutlineCenter = (centerX: number, centerY: number) => {
+    if (!selectedOutline || !selectedOutlineBounds) return;
+    patchSelectedOutline((outline) => translateOutline(
+      outline,
+      centerX - selectedOutlineBounds.centerX,
+      centerY - selectedOutlineBounds.centerY,
+    ));
+  };
+
+  const patchSelectedMatterStroke = (updater: (stroke: MapMatterStrokeData) => MapMatterStrokeData) => {
+    if (!selectedMatterStrokeId) return;
+    recordHistory();
+    updateProject((current) => ({
+      ...current,
+      matterStrokes: (current.matterStrokes || []).map((stroke) => stroke.id === selectedMatterStrokeId ? updater(stroke) : stroke),
+    }));
+    setStatus("元素物质画笔有未同步修改");
+  };
+
+  const patchSelectedMatterVisual = (patch: Partial<MapMatterAuthoringProfileData["visual"]>) => {
+    patchSelectedMatterStroke((stroke) => ({
+      ...stroke,
+      profile: { ...stroke.profile, visual: { ...stroke.profile.visual, ...patch } },
+    }));
+  };
+
+  const patchSelectedMatterPhysical = (patch: Partial<MapMatterAuthoringProfileData["physical"]>) => {
+    patchSelectedMatterStroke((stroke) => ({
+      ...stroke,
+      profile: { ...stroke.profile, physical: { ...stroke.profile.physical, ...patch } },
+    }));
+  };
+
+  const moveSelectedMatterCenter = (centerX: number, centerY: number) => {
+    if (!selectedMatterStroke || !selectedMatterBounds) return;
+    const offsetX = centerX - selectedMatterBounds.centerX;
+    const offsetY = centerY - selectedMatterBounds.centerY;
+    patchSelectedMatterStroke((stroke) => ({
+      ...stroke,
+      points: stroke.points.map((point) => ({ x: point.x + offsetX, y: point.y + offsetY })),
+    }));
+  };
+
   const removeSelectedObject = () => {
     if (!selectedObjectId) return;
     recordHistory();
     updateProject((current) => ({ ...current, objects: current.objects.filter((object) => object.id !== selectedObjectId) }));
-    setSelectedObjectId("");
+    clearCanvasSelection();
     setStatus("已删除物体 · 有未同步修改");
+  };
+
+  const loadRigidBodyControls = (
+    outlineId: string,
+    rigidBody: NonNullable<MapOutlineData["rigidBody"]>,
+    assetScoped: boolean,
+  ) => {
+    setEditingRigidOutlineId(outlineId);
+    setMode("iceBody");
+    setRigidTemplateId(rigidBody.templateId);
+    setRigidElementTag(rigidBody.elementTag);
+    setIceClosureMode(assetScoped ? "manual" : rigidBody.closureMode);
+    setIceRoutePreference(rigidBody.routePreference === "alternate" ? "alternate" : "shorter");
+    setIceSeed(rigidBody.seed);
+    setRigidBaseColor(rigidBody.visual.baseColor);
+    setRigidShadowColor(rigidBody.visual.shadowColor);
+    setRigidHighlightColor(rigidBody.visual.highlightColor);
+    setRigidEdgeColor(rigidBody.visual.edgeColor);
+    setRigidFractureColor(rigidBody.visual.fractureColor);
+    setRigidOpacity(rigidBody.visual.opacity);
+    setIceJaggedness(rigidBody.visual.edgeJaggedness);
+    setIceFacetSize(rigidBody.visual.facetScale);
+    setRigidFacetVariation(rigidBody.visual.facetVariation);
+    setIceTextureStrength(rigidBody.visual.textureStrength);
+    setRigidEdgeBrightness(rigidBody.visual.edgeBrightness);
+    setIceFrostWidth(rigidBody.visual.edgeWidthPixels);
+    setIceVolumeDepth(rigidBody.visual.volumeDepth);
+    setIceTransmission(rigidBody.visual.transmission);
+    setIceAbsorption(rigidBody.visual.absorption);
+    setRigidRoughness(rigidBody.visual.roughness);
+    setIceSpecularStrength(rigidBody.visual.specularStrength);
+    setIceInclusionDensity(rigidBody.visual.inclusionDensity);
+    setIceMicroCrackDensity(rigidBody.visual.microCrackDensity);
+    setRigidGrainDirection(rigidBody.visual.grainDirectionDegrees);
+    setRigidVisualAnisotropy(rigidBody.visual.anisotropy);
+    setIceLightAngleDegrees(rigidBody.visual.lightAngleDegrees);
+    setRigidPhysical({ ...rigidBody.physical });
+    setRigidFractureParameters({ ...rigidBody.fracture });
   };
 
   const patchAssetLayer = (assetId: string, layer: MapLayer) => {
     const asset = assetsRef.current[assetId];
-    if (!asset || asset.defaultLayer === layer) return;
-    recordHistory();
-    updateAssets((current) => ({ ...current, [assetId]: { ...current[assetId], defaultLayer: layer } }));
-    setStatus("已修改物体默认图层 · 有未同步修改");
+    if (!asset) return;
+    if (asset.defaultLayer !== layer) {
+      recordHistory();
+      updateAssets((current) => ({ ...current, [assetId]: { ...current[assetId], defaultLayer: layer } }));
+    }
+    setEditingAssetId(assetId);
+    clearCanvasSelection();
+    setEditingRigidOutlineId("");
+    if (layer === "rigid") {
+      const authoredRigid = asset.outlines?.find((outline) => outline.layer === "rigid" && outline.rigidBody)?.rigidBody;
+      const authoredOutline = asset.outlines?.find((outline) => outline.rigidBody === authoredRigid);
+      if (authoredRigid && authoredOutline) loadRigidBodyControls(authoredOutline.id, authoredRigid, true);
+      else setMode("iceBody");
+    } else {
+      setMode(layer === "occlusion" ? "occlusion" : "collision");
+    }
+    setStatus(`${asset.defaultLayer === layer ? "已选择" : "已修改"}物体素材 · ${asset.name} · ${layerLabels[layer]}`);
   };
 
   const openAssetOutlineEditor = (assetId: string) => {
@@ -1036,15 +1842,24 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
     drawingRef.current = null;
     setDrawing(null);
     setDropPreview(null);
-    setSelectedObjectId("");
+    clearCanvasSelection();
+    setEditingRigidOutlineId("");
     setEditingAssetId(assetId);
-    setMode("collision");
-    setStatus(`正在编辑物体轮廓模板 · ${asset.name}`);
+    if (asset.defaultLayer === "rigid") {
+      const authoredOutline = asset.outlines?.find((outline) => outline.layer === "rigid" && outline.rigidBody);
+      if (authoredOutline?.rigidBody) loadRigidBodyControls(authoredOutline.id, authoredOutline.rigidBody, true);
+      else setMode("iceBody");
+    } else {
+      setMode(asset.defaultLayer === "occlusion" ? "occlusion" : "collision");
+    }
+    setStatus(`已选择物体素材 · ${asset.name} · ${layerLabels[asset.defaultLayer]}`);
   };
 
   const closeAssetOutlineEditor = () => {
     drawingRef.current = null;
     setDrawing(null);
+    setEditingRigidOutlineId("");
+    clearCanvasSelection();
     setEditingAssetId("");
     setMode("select");
     setStatus("已返回地图画布");
@@ -1056,6 +1871,7 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
     updateActiveOutlineCollections((outlines, draftOutlines) => outlines.length
       ? { outlines: outlines.slice(0, -1), draftOutlines }
       : { outlines, draftOutlines: draftOutlines.slice(0, -1) });
+    setSelectedOutlineId("");
     setStatus(editingAsset ? "已撤销物体模板的上一条轮廓" : "已撤销上一条地图轮廓 · 有未同步修改");
   };
 
@@ -1070,19 +1886,218 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
     if (!activeOutlines.length && !activeDraftOutlines.length) return;
     recordHistory();
     updateActiveOutlineCollections(() => ({ outlines: [], draftOutlines: [] }));
+    setEditingRigidOutlineId("");
+    setSelectedOutlineId("");
     setStatus(editingAsset ? "已清空物体模板全部轮廓" : "已清空全部地图轮廓 · 有未同步修改");
   };
 
   const deleteOutline = (outlineId: string) => {
     recordHistory();
     updateActiveOutlineCollections((outlines, draftOutlines) => ({ outlines: outlines.filter((outline) => outline.id !== outlineId), draftOutlines }));
+    if (editingRigidOutlineId === outlineId) setEditingRigidOutlineId("");
+    if (selectedOutlineId === outlineId) setSelectedOutlineId("");
     setStatus(editingAsset ? "已删除物体模板轮廓" : "已删除地图轮廓 · 有未同步修改");
+  };
+
+  const convertOutlineToProgramRigid = (outlineId: string) => {
+    const outline = activeOutlines.find((item) => item.id === outlineId);
+    if (!outline || outline.layer !== "rigid" || outline.rigidBody || outline.points.length < 3) return;
+    if (editingAsset && activeOutlines.filter((item) => item.layer === "rigid").length > 1) {
+      setStatus("物体素材含多条刚体轮廓，无法确定唯一程序刚体；请保留一条闭合轮廓后再转换");
+      return;
+    }
+    const result = buildProceduralRigidBody({
+      id: outline.id,
+      userPoints: outline.points,
+      closureMode: "manual",
+      seed: iceSeed,
+      templateId: rigidTemplateId,
+      elementTag: rigidElementTag,
+      visual: iceVisual,
+      physical: { ...rigidPhysical, anchoringMode: "dynamic" },
+      fracture: iceFracture,
+    });
+    if (!result.ok || !result.rigidBody) {
+      setStatus(`转换程序刚体失败：${result.message}`);
+      return;
+    }
+    recordHistory();
+    updateActiveOutlineCollections((outlines, draftOutlines) => ({
+      outlines: outlines.map((item) => item.id === outlineId
+        ? { ...item, closed: true, points: result.points, iceBody: undefined, rigidBody: result.rigidBody }
+        : item),
+      draftOutlines,
+    }));
+    setIceSeed((value) => (value + 1) >>> 0 || 1);
+    setStatus(`已转换为${PROCEDURAL_RIGID_TEMPLATES[result.rigidBody.templateId].label}程序刚体 · ${result.rigidBody.facets.length} 个分面`);
+  };
+
+  const applyProceduralRigidTemplate = (templateId: ProceduralRigidTemplateId) => {
+    const template = PROCEDURAL_RIGID_TEMPLATES[templateId];
+    setRigidTemplateId(templateId);
+    setRigidElementTag((current) => current.trim() ? current : template.defaultElementTag);
+    setRigidBaseColor(template.visual.baseColor);
+    setRigidShadowColor(template.visual.shadowColor);
+    setRigidHighlightColor(template.visual.highlightColor);
+    setRigidEdgeColor(template.visual.edgeColor);
+    setRigidFractureColor(template.visual.fractureColor);
+    setRigidOpacity(template.visual.opacity);
+    setIceJaggedness(template.visual.edgeJaggedness);
+    setIceFacetSize(template.visual.facetScale);
+    setIceTextureStrength(template.visual.textureStrength);
+    setIceVolumeDepth(template.visual.volumeDepth);
+    setIceTransmission(template.visual.transmission);
+    setIceAbsorption(template.visual.absorption);
+    setIceFrostWidth(template.visual.edgeWidthPixels);
+    setIceSpecularStrength(template.visual.specularStrength);
+    setIceInclusionDensity(template.visual.inclusionDensity);
+    setIceMicroCrackDensity(template.visual.microCrackDensity);
+    setRigidFacetVariation(template.visual.facetVariation);
+    setRigidEdgeBrightness(template.visual.edgeBrightness);
+    setRigidRoughness(template.visual.roughness);
+    setRigidGrainDirection(template.visual.grainDirectionDegrees);
+    setRigidVisualAnisotropy(template.visual.anisotropy);
+    setIceLightAngleDegrees(template.visual.lightAngleDegrees);
+    setRigidPhysical({ ...template.physical });
+    setRigidFractureParameters({ ...template.fracture });
+  };
+
+  const loadProceduralRigidParameters = (outlineId: string) => {
+    const outline = activeOutlines.find((item) => item.id === outlineId);
+    const rigidBody = outline?.rigidBody;
+    if (!outline || !rigidBody) return;
+    selectCanvasTarget("outline", outlineId);
+    loadRigidBodyControls(outlineId, rigidBody, Boolean(editingAsset));
+    setStatus(`正在编辑程序刚体参数 · ${rigidBody.elementTag || "无标签"}`);
+  };
+
+  const rebuildEditingRigid = (outline: MapOutlineData, assetScoped: boolean): ProceduralRigidBuildResult => {
+    const previous = outline.rigidBody;
+    if (!previous) return { ok: false, message: "目标程序刚体缺少作者参数", points: [], candidates: [], selectedCandidateIndex: -1 };
+    const closureMode = assetScoped ? "manual" : iceClosureMode;
+    return buildProceduralRigidBody({
+      id: outline.id,
+      userPoints: previous.authoringPoints?.length && previous.authoringPoints.length >= 3
+        ? previous.authoringPoints
+        : outline.points,
+      closureMode,
+      terrainContours: assetScoped ? [] : iceTerrainContours,
+      routePreference: iceRoutePreference,
+      seed: iceSeed,
+      templateId: rigidTemplateId,
+      elementTag: rigidElementTag,
+      visual: iceVisual,
+      physical: {
+        ...rigidPhysical,
+        anchoringMode: assetScoped ? "dynamic" : closureMode === "terrain" ? "terrainAttached" : rigidPhysical.anchoringMode,
+      },
+      fracture: iceFracture,
+      snapDistance: 14 / Math.max(0.05, view.zoom),
+    });
+  };
+
+  const mergeRebuiltRigid = (outline: MapOutlineData, result: ProceduralRigidBuildResult): MapOutlineData => {
+    const previous = outline.rigidBody;
+    const rebuilt = result.rigidBody;
+    if (!previous || !result.ok || !rebuilt) return outline;
+    return {
+      ...outline,
+      points: result.points,
+      iceBody: undefined,
+      rigidBody: {
+        ...previous,
+        ...rebuilt,
+        terrainBinding: rebuilt.terrainBinding,
+        visual: { ...previous.visual, ...rebuilt.visual },
+        physical: { ...previous.physical, ...rebuilt.physical },
+        fracture: { ...previous.fracture, ...rebuilt.fracture },
+      },
+    };
+  };
+
+  const applyParametersToEditingRigid = () => {
+    if (!editingRigidOutlineId) return;
+    const outline = activeOutlines.find((item) => item.id === editingRigidOutlineId);
+    const previous = outline?.rigidBody;
+    if (!outline || !previous) {
+      setEditingRigidOutlineId("");
+      setStatus("目标程序刚体已不存在，请重新选择");
+      return;
+    }
+    const result = rebuildEditingRigid(outline, Boolean(editingAsset));
+    if (!result.ok || !result.rigidBody) {
+      setStatus(`程序刚体参数未应用：${result.message}`);
+      return;
+    }
+    const nextOutline = mergeRebuiltRigid(outline, result);
+    const nextRigidBody = nextOutline.rigidBody!;
+    recordHistory();
+    updateActiveOutlineCollections((outlines, draftOutlines) => ({
+      outlines: outlines.map((item) => item.id === editingRigidOutlineId ? nextOutline : item),
+      draftOutlines,
+    }));
+    setStatus(`已应用程序刚体参数 · ${nextRigidBody.elementTag || "无标签"} · ${nextRigidBody.facets.length} 分面`);
+  };
+
+  const stageEditingRigidForPersistence = (
+    sourceProject: MapProject,
+    sourceAssets: Record<string, MapAssetRef>,
+  ): { project: MapProject; assets: Record<string, MapAssetRef>; error?: string; changed: boolean } => {
+    if (!editingRigidOutlineId) return { project: sourceProject, assets: sourceAssets, changed: false };
+    if (editingAssetId) {
+      const asset = sourceAssets[editingAssetId];
+      const outline = asset?.outlines?.find((item) => item.id === editingRigidOutlineId);
+      if (!asset || !outline?.rigidBody) return { project: sourceProject, assets: sourceAssets, error: "正在编辑的物体库程序刚体已不存在", changed: false };
+      const result = rebuildEditingRigid(outline, true);
+      if (!result.ok || !result.rigidBody) return { project: sourceProject, assets: sourceAssets, error: result.message, changed: false };
+      const nextOutline = mergeRebuiltRigid(outline, result);
+      return {
+        project: sourceProject,
+        assets: {
+          ...sourceAssets,
+          [asset.id]: {
+            ...asset,
+            outlines: (asset.outlines || []).map((item) => item.id === outline.id ? nextOutline : item),
+          },
+        },
+        changed: true,
+      };
+    }
+    const outline = sourceProject.outlines.find((item) => item.id === editingRigidOutlineId);
+    if (!outline?.rigidBody) return { project: sourceProject, assets: sourceAssets, error: "正在编辑的地图程序刚体已不存在", changed: false };
+    const result = rebuildEditingRigid(outline, false);
+    if (!result.ok || !result.rigidBody) return { project: sourceProject, assets: sourceAssets, error: result.message, changed: false };
+    const nextOutline = mergeRebuiltRigid(outline, result);
+    return {
+      project: { ...sourceProject, outlines: sourceProject.outlines.map((item) => item.id === outline.id ? nextOutline : item) },
+      assets: sourceAssets,
+      changed: true,
+    };
   };
 
   const deleteDraftOutline = (outlineId: string) => {
     recordHistory();
     updateActiveOutlineCollections((outlines, draftOutlines) => ({ outlines, draftOutlines: draftOutlines.filter((outline) => outline.id !== outlineId) }));
     setStatus(editingAsset ? "已删除物体模板轮廓草稿" : "已删除地图轮廓草稿 · 有未同步修改");
+  };
+
+  const deleteMatterStroke = (strokeId: string) => {
+    recordHistory();
+    updateProject((current) => ({ ...current, matterStrokes: (current.matterStrokes || []).filter((stroke) => stroke.id !== strokeId) }));
+    if (selectedMatterStrokeId === strokeId) setSelectedMatterStrokeId("");
+    setStatus("已删除元素物质画笔 · 有未同步修改");
+  };
+
+  const removeSelectedCanvasTarget = () => {
+    if (selectedObjectId) {
+      removeSelectedObject();
+      return;
+    }
+    if (selectedOutlineId) {
+      deleteOutline(selectedOutlineId);
+      return;
+    }
+    if (selectedMatterStrokeId) deleteMatterStroke(selectedMatterStrokeId);
   };
 
   useEffect(() => {
@@ -1099,13 +2114,15 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
         redoMap();
         return;
       }
-      if ((event.key === "Delete" || event.key === "Backspace") && !editing && selectedObjectId) {
+      if ((event.key === "Delete" || event.key === "Backspace") && !editing && selectedCanvasKind) {
         event.preventDefault();
-        removeSelectedObject();
+        removeSelectedCanvasTarget();
       }
       if (event.key === "Escape") {
         drawingRef.current = null;
         setDrawing(null);
+        matterDrawingRef.current = null;
+        setMatterDrawing(null);
         setDropPreview(null);
         setIsPanning(false);
         pointerRef.current = null;
@@ -1113,7 +2130,7 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [redoMap, selectedObjectId, undoMap]);
+  }, [redoMap, selectedCanvasKind, selectedMatterStrokeId, selectedObjectId, selectedOutlineId, undoMap]);
 
   const listUnityContent = async (path: string) => {
     const [prefabResponse, mapResponse] = await Promise.all([
@@ -1358,8 +2375,18 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
       }
       setPendingMapOverwrite(null);
       setConnection((current) => current ? { ...current, phase: "syncing", message: "正在同步地图数据、资源和 Prefab..." } : current);
-      const referencedIds = new Set([project.backgroundAssetId, ...project.objects.map((item) => item.assetId)].filter(Boolean));
-      const referencedAssets = Object.values(assets).filter((asset) => referencedIds.has(asset.id));
+      const staged = stageEditingRigidForPersistence(projectRef.current, assetsRef.current);
+      if (staged.error) throw new Error(`程序刚体参数无法保存：${staged.error}`);
+      if (staged.changed) {
+        projectRef.current = staged.project;
+        assetsRef.current = staged.assets;
+        setProject(staged.project);
+        setAssets(staged.assets);
+      }
+      const persistentProject = ensureProgramRigidProject(staged.project);
+      const persistentAssets = ensureProgramRigidAssets(staged.assets);
+      const referencedIds = new Set([persistentProject.backgroundAssetId, ...persistentProject.objects.map((item) => item.assetId)].filter(Boolean));
+      const referencedAssets = Object.values(persistentAssets).filter((asset) => referencedIds.has(asset.id));
       for (let index = 0; index < referencedAssets.length; index += 1) {
         await uploadMapAsset(path, referencedAssets[index], index, referencedAssets.length, overwriteTarget);
       }
@@ -1369,7 +2396,7 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           projectPath: path,
-          project,
+          project: persistentProject,
           assets: referencedAssets.map(mapAssetMetadata),
           targetJsonPath: editingUnityMapPath,
           overwriteJsonPath: overwriteTarget?.jsonPath || "",
@@ -1424,6 +2451,9 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
     { value: "pan", label: "平移", icon: <Hand size={15} /> },
     { value: "groundLine", label: "矩形碰撞", icon: <Box size={15} /> },
     { value: "collision", label: "碰撞区域", icon: <Pencil size={15} /> },
+    { value: "iceBody", label: "程序刚体", icon: <Snowflake size={15} /> },
+    { value: "liquid", label: "液体画笔", icon: <CircleDot size={15} /> },
+    { value: "gas", label: "气体画笔", icon: <Eye size={15} /> },
     { value: "occlusion", label: "遮挡区域", icon: <Eye size={15} /> },
   ];
 
@@ -1491,13 +2521,14 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
               draggable
               aria-label={`拖动 ${asset.name}`}
               title={editingAssetId === asset.id ? "正在编辑该物体的轮廓模板" : "拖到地图画布"}
+              onClick={() => openAssetOutlineEditor(asset.id)}
               onDragStart={(event) => startAssetDrag(event, asset)}
               onDragEnd={stopAssetDrag}
             >
               <GripVertical className="map-asset-grip" size={14} />
               <img src={asset.url} alt="" draggable={false} />
               <span><strong>{asset.name}</strong><small>{asset.width}×{asset.height}{asset.outlines?.length ? ` · ${asset.outlines.length} 条自定义轮廓` : ""}</small><select aria-label={`${asset.name} 默认图层`} value={asset.defaultLayer} onClick={(event) => event.stopPropagation()} onChange={(event) => patchAssetLayer(asset.id, event.target.value as MapLayer)}>{Object.entries(layerLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></span>
-              <button type="button" className="map-asset-draw-button" title={`在独立画布绘制 ${asset.name} 的碰撞或遮挡轮廓`} onClick={(event) => { event.stopPropagation(); openAssetOutlineEditor(asset.id); }}><Pencil size={12} /><span>绘制</span></button>
+              <button type="button" className="map-asset-draw-button" title={`编辑 ${asset.name} 的层级参数和轮廓`} onClick={(event) => { event.stopPropagation(); openAssetOutlineEditor(asset.id); }}><Pencil size={12} /><span>编辑</span></button>
             </div>)}
           </div>
         </section>
@@ -1506,8 +2537,8 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
       <main className="map-workspace">
         <div className="map-toolbar">
           <div className="map-toolbar-main">
-            {editingAsset && <button type="button" className="map-return-button" title="保存当前模板数据并返回地图画布" onClick={closeAssetOutlineEditor}><ChevronLeft size={14} /><span>返回地图</span></button>}
-            <div className="map-mode-control">{modes.filter((item) => !editingAsset || item.value !== "select").map((item) => <button type="button" key={item.value} className={mode === item.value ? "active" : ""} title={item.label} onClick={() => setMode(item.value)}>{item.icon}<span>{item.label}</span></button>)}</div>
+            {editingAsset && <button type="button" className="map-return-button" title="保存当前模板数据并返回地图画布" onClick={() => { if (editingRigidOutlineId) applyParametersToEditingRigid(); closeAssetOutlineEditor(); }}><ChevronLeft size={14} /><span>保存并返回地图</span></button>}
+            <div className="map-mode-control">{modes.filter((item) => !editingAsset || !["select", "liquid", "gas"].includes(item.value)).map((item) => <button type="button" key={item.value} className={mode === item.value ? "active" : ""} title={item.label} onClick={() => setMode(item.value)}>{item.icon}<span>{item.label}</span></button>)}</div>
           </div>
           <div className="map-tool-options">
             {mode === "groundLine" && <>
@@ -1516,6 +2547,119 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
               <label className="map-snap-option"><input type="checkbox" checked={groundSideCollision} onChange={(event) => setGroundSideCollision(event.target.checked)} /><span>侧面碰撞</span></label>
               <label><span>厚度</span><NumericInput value={groundThickness} min={1} max={256} integer onValueChange={(value) => setGroundThickness(Math.max(1, Math.min(256, value)))} /></label>
               <label className="map-snap-option" title="开启后，终点接近起点水平线时自动对齐"><input type="checkbox" checked={autoHorizontalSnap} onChange={(event) => setAutoHorizontalSnap(event.target.checked)} /><span>自动水平吸附</span></label>
+            </>}
+            {(mode === "liquid" || mode === "gas") && <>
+              <label><span>元素标签</span><input aria-label="物质元素标签" value={matterElementTag} placeholder="例如 water / ice / 自定义名称" onChange={(event) => setMatterElementTag(event.target.value)} /></label>
+              <label><span>画笔半径</span><NumericInput value={matterBrushRadius} min={1} max={256} integer onValueChange={(value) => setMatterBrushRadius(Math.max(1, Math.min(256, value)))} /></label>
+              <details className="map-rigid-settings" open><summary>{matterCarrier === "liquid" ? "液体外观参数" : "气体外观参数"}</summary><div>
+                <label><span>基础色</span><input type="color" value={activeMatterProfile.visual.baseColor} onChange={(event) => patchMatterProfile((profile) => ({ ...profile, visual: { ...profile.visual, baseColor: event.target.value } }))} /></label>
+                <label><span>辅色</span><input type="color" value={activeMatterProfile.visual.secondaryColor} onChange={(event) => patchMatterProfile((profile) => ({ ...profile, visual: { ...profile.visual, secondaryColor: event.target.value } }))} /></label>
+                <label><span>发光色</span><input type="color" value={activeMatterProfile.visual.emissionColor} onChange={(event) => patchMatterProfile((profile) => ({ ...profile, visual: { ...profile.visual, emissionColor: event.target.value } }))} /></label>
+                <label><span>不透明度%</span><NumericInput value={Math.round(activeMatterProfile.visual.opacity * 100)} min={0} max={100} integer onValueChange={(value) => patchMatterProfile((profile) => ({ ...profile, visual: { ...profile.visual, opacity: Math.max(0, Math.min(100, value)) / 100 } }))} /></label>
+                <label><span>颗粒大小</span><NumericInput value={activeMatterProfile.visual.particleScale} min={0.1} max={4} step={0.05} onValueChange={(value) => patchMatterProfile((profile) => ({ ...profile, visual: { ...profile.visual, particleScale: Math.max(0.1, Math.min(4, value)) } }))} /></label>
+                <label><span>边缘柔和</span><NumericInput value={activeMatterProfile.visual.edgeSoftness} min={0} max={1} step={0.05} onValueChange={(value) => patchMatterProfile((profile) => ({ ...profile, visual: { ...profile.visual, edgeSoftness: Math.max(0, Math.min(1, value)) } }))} /></label>
+                <label><span>细节缩放</span><NumericInput value={activeMatterProfile.visual.detailScale} min={0.1} max={8} step={0.1} onValueChange={(value) => patchMatterProfile((profile) => ({ ...profile, visual: { ...profile.visual, detailScale: Math.max(0.1, Math.min(8, value)) } }))} /></label>
+                <label><span>折射</span><NumericInput value={activeMatterProfile.visual.refractionStrength} min={0} max={1} step={0.05} onValueChange={(value) => patchMatterProfile((profile) => ({ ...profile, visual: { ...profile.visual, refractionStrength: Math.max(0, Math.min(1, value)) } }))} /></label>
+                <label><span>发光强度</span><NumericInput value={activeMatterProfile.visual.glowStrength} min={0} max={8} step={0.1} onValueChange={(value) => patchMatterProfile((profile) => ({ ...profile, visual: { ...profile.visual, glowStrength: Math.max(0, Math.min(8, value)) } }))} /></label>
+                {matterCarrier === "liquid" && <label><span>泡沫量</span><NumericInput value={activeMatterProfile.visual.foamAmount} min={0} max={1} step={0.05} onValueChange={(value) => patchMatterProfile((profile) => ({ ...profile, visual: { ...profile.visual, foamAmount: Math.max(0, Math.min(1, value)) } }))} /></label>}
+              </div></details>
+              <details className="map-rigid-settings" open><summary>{matterCarrier === "liquid" ? "液体物理参数" : "气体物理参数"}</summary><div>
+                <label><span>密度</span><NumericInput value={activeMatterProfile.physical.density} min={0.001} max={100} step={0.05} onValueChange={(value) => patchMatterProfile((profile) => ({ ...profile, physical: { ...profile.physical, density: Math.max(0.001, Math.min(100, value)) } }))} /></label>
+                <label><span>黏度</span><NumericInput value={activeMatterProfile.physical.viscosity} min={0} max={8} step={0.05} onValueChange={(value) => patchMatterProfile((profile) => ({ ...profile, physical: { ...profile.physical, viscosity: Math.max(0, Math.min(8, value)) } }))} /></label>
+                <label><span>流动速度</span><NumericInput value={activeMatterProfile.physical.flowSpeed} min={0.05} max={8} step={0.05} onValueChange={(value) => patchMatterProfile((profile) => ({ ...profile, physical: { ...profile.physical, flowSpeed: Math.max(0.05, Math.min(8, value)) } }))} /></label>
+                <label><span>重力倍率</span><NumericInput value={activeMatterProfile.physical.gravityScale} min={-4} max={4} step={0.05} onValueChange={(value) => patchMatterProfile((profile) => ({ ...profile, physical: { ...profile.physical, gravityScale: Math.max(-4, Math.min(4, value)) } }))} /></label>
+                <label><span>扩散</span><NumericInput value={activeMatterProfile.physical.diffusion} min={0} max={4} step={0.05} onValueChange={(value) => patchMatterProfile((profile) => ({ ...profile, physical: { ...profile.physical, diffusion: Math.max(0, Math.min(4, value)) } }))} /></label>
+                <label><span>浮力</span><NumericInput value={activeMatterProfile.physical.buoyancy} min={-4} max={4} step={0.05} onValueChange={(value) => patchMatterProfile((profile) => ({ ...profile, physical: { ...profile.physical, buoyancy: Math.max(-4, Math.min(4, value)) } }))} /></label>
+                <label><span>阻力</span><NumericInput value={activeMatterProfile.physical.drag} min={0} max={8} step={0.05} onValueChange={(value) => patchMatterProfile((profile) => ({ ...profile, physical: { ...profile.physical, drag: Math.max(0, Math.min(8, value)) } }))} /></label>
+                {matterCarrier === "liquid" && <>
+                  <label><span>表面张力</span><NumericInput value={activeMatterProfile.physical.surfaceTension} min={0} max={4} step={0.05} onValueChange={(value) => patchMatterProfile((profile) => ({ ...profile, physical: { ...profile.physical, surfaceTension: Math.max(0, Math.min(4, value)) } }))} /></label>
+                  <label><span>蒸发半衰期秒</span><NumericInput value={activeMatterProfile.physical.evaporationHalfLifeSeconds} min={0} max={86400} step={10} onValueChange={(value) => patchMatterProfile((profile) => ({ ...profile, physical: { ...profile.physical, evaporationHalfLifeSeconds: Math.max(0, Math.min(86400, value)) } }))} /></label>
+                </>}
+                {matterCarrier === "gas" && <label><span>逸散半衰期秒</span><NumericInput value={activeMatterProfile.physical.dissipationHalfLifeSeconds} min={0} max={86400} step={10} onValueChange={(value) => patchMatterProfile((profile) => ({ ...profile, physical: { ...profile.physical, dissipationHalfLifeSeconds: Math.max(0, Math.min(86400, value)) } }))} /></label>}
+              </div></details>
+            </>}
+            {mode === "iceBody" && <>
+              <label><span>模板</span><select aria-label="程序刚体模板" value={rigidTemplateId} onChange={(event) => applyProceduralRigidTemplate(event.target.value as ProceduralRigidTemplateId)}>{Object.values(PROCEDURAL_RIGID_TEMPLATES).map((template) => <option key={template.id} value={template.id}>{template.label}</option>)}</select></label>
+              <label><span>元素标签</span><input aria-label="程序刚体元素标签" value={rigidElementTag} placeholder={`建议：${rigidTemplate.defaultElementTag || "自定义"}`} onChange={(event) => setRigidElementTag(event.target.value)} /></label>
+              <button type="button" className="map-ice-reroll" disabled={!rigidTemplate.defaultElementTag} onClick={() => setRigidElementTag(rigidTemplate.defaultElementTag)}>采用建议标签</button>
+              {editingRigidOutlineId && <>
+                <span className="map-template-closure-note">正在编辑已有刚体</span>
+                <button type="button" className="map-ice-reroll" onClick={applyParametersToEditingRigid}>应用到当前刚体</button>
+                <button type="button" className="map-ice-reroll" onClick={() => setEditingRigidOutlineId("")}>退出编辑</button>
+              </>}
+              {editingAsset ? <span className="map-template-closure-note">物体素材仅支持完整手绘</span> : <label><span>封边</span><select aria-label="程序刚体封边方式" value={iceClosureMode} onChange={(event) => setIceClosureMode(event.target.value as IceBodyClosureMode)}><option value="manual">完整手绘</option><option value="terrain">借地形闭合</option></select></label>}
+              {!editingAsset && iceClosureMode === "terrain" && <label><span>路径</span><select aria-label="借用地形路径" value={iceRoutePreference} onChange={(event) => setIceRoutePreference(event.target.value as ProceduralRigidTerrainRoutePreference)}><option value="shorter">较短侧</option><option value="alternate">另一侧</option></select></label>}
+              <label><span>种子</span><NumericInput value={iceSeed} min={1} max={4294967295} integer onValueChange={(value) => setIceSeed(Math.max(1, Math.floor(value)) >>> 0 || 1)} /></label>
+              <button type="button" className="map-ice-reroll" title="更换程序纹理随机种子" onClick={() => setIceSeed((value) => (Math.imul(value, 1664525) + 1013904223) >>> 0 || 1)}><RotateCcw size={13} />换纹理</button>
+              <details className="map-rigid-settings" open><summary>{editingAsset ? "原图破损表现" : "程序外观"}</summary><div>
+                {editingAsset && <span className="map-template-closure-note">主体颜色、纹理和透明轮廓来自原图片；这里仅配置裂纹、断面和碎屑表现</span>}
+                {!editingAsset && <>
+                <label><span>基础色</span><input type="color" aria-label="程序刚体基础色" value={rigidBaseColor} onChange={(event) => setRigidBaseColor(event.target.value)} /></label>
+                <label><span>暗部色</span><input type="color" aria-label="程序刚体暗部色" value={rigidShadowColor} onChange={(event) => setRigidShadowColor(event.target.value)} /></label>
+                <label><span>高光色</span><input type="color" aria-label="程序刚体高光色" value={rigidHighlightColor} onChange={(event) => setRigidHighlightColor(event.target.value)} /></label>
+                </>}
+                <label><span>破碎特效色</span><input type="color" aria-label="程序刚体破碎特效色" value={rigidFractureColor} onChange={(event) => setRigidFractureColor(event.target.value)} /></label>
+                <label><span>边缘色</span><input type="color" aria-label="程序刚体边缘色" value={rigidEdgeColor} onChange={(event) => setRigidEdgeColor(event.target.value)} /></label>
+                {!editingAsset && <>
+                <label><span>不透明%</span><NumericInput value={Math.round(rigidOpacity * 100)} min={0} max={100} integer onValueChange={(value) => setRigidOpacity(Math.max(0, Math.min(100, value)) / 100)} /></label>
+                <label><span>边缘锯齿%</span><NumericInput value={Math.round(iceJaggedness * 100)} min={0} max={100} integer onValueChange={(value) => setIceJaggedness(Math.max(0, Math.min(100, value)) / 100)} /></label>
+                <label><span>分面尺寸</span><NumericInput value={iceFacetSize} min={6} max={128} integer onValueChange={(value) => setIceFacetSize(Math.max(6, Math.min(128, value)))} /></label>
+                <label><span>分面变化%</span><NumericInput value={Math.round(rigidFacetVariation * 100)} min={0} max={100} integer onValueChange={(value) => setRigidFacetVariation(Math.max(0, Math.min(100, value)) / 100)} /></label>
+                <label><span>纹理强度%</span><NumericInput value={Math.round(iceTextureStrength * 100)} min={0} max={100} integer onValueChange={(value) => setIceTextureStrength(Math.max(0, Math.min(100, value)) / 100)} /></label>
+                </>}
+                <label><span>边缘亮度%</span><NumericInput value={Math.round(rigidEdgeBrightness * 100)} min={0} max={100} integer onValueChange={(value) => setRigidEdgeBrightness(Math.max(0, Math.min(100, value)) / 100)} /></label>
+                <label><span>边缘宽度</span><NumericInput value={iceFrostWidth} min={0} max={24} onValueChange={(value) => setIceFrostWidth(Math.max(0, Math.min(24, value)))} /></label>
+                {!editingAsset && <>
+                <label><span>体积%</span><NumericInput value={Math.round(iceVolumeDepth * 100)} min={0} max={100} integer onValueChange={(value) => setIceVolumeDepth(Math.max(0, Math.min(100, value)) / 100)} /></label>
+                <label><span>透光%</span><NumericInput value={Math.round(iceTransmission * 100)} min={0} max={100} integer onValueChange={(value) => setIceTransmission(Math.max(0, Math.min(100, value)) / 100)} /></label>
+                <label><span>吸收%</span><NumericInput value={Math.round(iceAbsorption * 100)} min={0} max={100} integer onValueChange={(value) => setIceAbsorption(Math.max(0, Math.min(100, value)) / 100)} /></label>
+                <label><span>粗糙度%</span><NumericInput value={Math.round(rigidRoughness * 100)} min={0} max={100} integer onValueChange={(value) => setRigidRoughness(Math.max(0, Math.min(100, value)) / 100)} /></label>
+                <label><span>高光%</span><NumericInput value={Math.round(iceSpecularStrength * 100)} min={0} max={100} integer onValueChange={(value) => setIceSpecularStrength(Math.max(0, Math.min(100, value)) / 100)} /></label>
+                <label><span>夹杂%</span><NumericInput value={Math.round(iceInclusionDensity * 100)} min={0} max={100} integer onValueChange={(value) => setIceInclusionDensity(Math.max(0, Math.min(100, value)) / 100)} /></label>
+                </>}
+                <label><span>微裂%</span><NumericInput value={Math.round(iceMicroCrackDensity * 100)} min={0} max={100} integer onValueChange={(value) => setIceMicroCrackDensity(Math.max(0, Math.min(100, value)) / 100)} /></label>
+                {!editingAsset && <>
+                <label><span>纹理方向°</span><NumericInput value={rigidGrainDirection} min={-180} max={180} onValueChange={(value) => setRigidGrainDirection(Math.max(-180, Math.min(180, value)))} /></label>
+                <label><span>方向性%</span><NumericInput value={Math.round(rigidVisualAnisotropy * 100)} min={0} max={100} integer onValueChange={(value) => setRigidVisualAnisotropy(Math.max(0, Math.min(100, value)) / 100)} /></label>
+                <label><span>光向°</span><NumericInput value={iceLightAngleDegrees} min={-180} max={180} integer onValueChange={(value) => setIceLightAngleDegrees(Math.max(-180, Math.min(180, value)))} /></label>
+                </>}
+              </div></details>
+              <details className="map-rigid-settings"><summary>物理</summary><div>
+                <label><span>锚定</span><select value={editingAsset ? "dynamic" : iceClosureMode === "terrain" ? "terrainAttached" : rigidPhysical.anchoringMode} disabled={Boolean(editingAsset || iceClosureMode === "terrain")} onChange={(event) => setRigidPhysical((current) => ({ ...current, anchoringMode: event.target.value as ProceduralRigidPhysicalAuthoringData["anchoringMode"] }))}><option value="dynamic">动态</option><option value="fixed">固定</option><option value="terrainAttached">附着地形</option></select></label>
+                <label><span>密度</span><NumericInput value={rigidPhysical.density} min={0.001} max={100} onValueChange={(value) => setRigidPhysical((current) => ({ ...current, density: Math.max(0.001, value) }))} /></label>
+                <label><span>重力倍率</span><NumericInput value={rigidPhysical.gravityScale} min={-8} max={8} onValueChange={(value) => setRigidPhysical((current) => ({ ...current, gravityScale: Math.max(-8, Math.min(8, value)) }))} /></label>
+                <label><span>摩擦%</span><NumericInput value={Math.round(rigidPhysical.friction * 100)} min={0} max={100} integer onValueChange={(value) => setRigidPhysical((current) => ({ ...current, friction: Math.max(0, Math.min(100, value)) / 100 }))} /></label>
+                <label><span>弹性%</span><NumericInput value={Math.round(rigidPhysical.restitution * 100)} min={0} max={100} integer onValueChange={(value) => setRigidPhysical((current) => ({ ...current, restitution: Math.max(0, Math.min(100, value)) / 100 }))} /></label>
+                <label><span>线性阻尼</span><NumericInput value={rigidPhysical.linearDamping} min={0} max={20} onValueChange={(value) => setRigidPhysical((current) => ({ ...current, linearDamping: Math.max(0, Math.min(20, value)) }))} /></label>
+                <label><span>旋转阻尼</span><NumericInput value={rigidPhysical.angularDamping} min={0} max={20} onValueChange={(value) => setRigidPhysical((current) => ({ ...current, angularDamping: Math.max(0, Math.min(20, value)) }))} /></label>
+                <label><span>硬度%</span><NumericInput value={Math.round(rigidPhysical.hardness * 100)} min={0} max={100} integer onValueChange={(value) => setRigidPhysical((current) => ({ ...current, hardness: Math.max(0, Math.min(100, value)) / 100 }))} /></label>
+                <label><span>韧性%</span><NumericInput value={Math.round(rigidPhysical.toughness * 100)} min={0} max={100} integer onValueChange={(value) => setRigidPhysical((current) => ({ ...current, toughness: Math.max(0, Math.min(100, value)) / 100 }))} /></label>
+                <label><span>脆性%</span><NumericInput value={Math.round(rigidPhysical.brittleness * 100)} min={0} max={100} integer onValueChange={(value) => setRigidPhysical((current) => ({ ...current, brittleness: Math.max(0, Math.min(100, value)) / 100 }))} /></label>
+                <label><span>各向异性%</span><NumericInput value={Math.round(rigidPhysical.anisotropy * 100)} min={0} max={100} integer onValueChange={(value) => setRigidPhysical((current) => ({ ...current, anisotropy: Math.max(0, Math.min(100, value)) / 100 }))} /></label>
+                <label><span>材料纹向°</span><NumericInput value={rigidPhysical.grainAngleDegrees} min={-180} max={180} onValueChange={(value) => setRigidPhysical((current) => ({ ...current, grainAngleDegrees: Math.max(-180, Math.min(180, value)) }))} /></label>
+                <label><span>碎屑比例%</span><NumericInput value={Math.round(rigidPhysical.debrisFraction * 100)} min={0} max={100} integer onValueChange={(value) => setRigidPhysical((current) => ({ ...current, debrisFraction: Math.max(0, Math.min(100, value)) / 100 }))} /></label>
+              </div></details>
+              <details className="map-rigid-settings"><summary>破碎</summary><div>
+                <p className="map-rigid-settings-note">攻击能量和落地能量分别判定。结构损伤会累积：先崩边，再出现裂纹，累计到失效值后才释放主碎片。硬度、韧性越高，累积越慢；脆性越高，裂纹扩展越快、碎片越多。</p>
+                <label><span>主碎片最少</span><NumericInput value={rigidFractureParameters.primaryFragmentMin} min={2} max={8} integer onValueChange={(value) => setRigidFractureParameters((current) => ({ ...current, primaryFragmentMin: Math.max(2, Math.min(8, value)) }))} /></label>
+                <label><span>主碎片最多</span><NumericInput value={rigidFractureParameters.primaryFragmentMax} min={2} max={8} integer onValueChange={(value) => setRigidFractureParameters((current) => ({ ...current, primaryFragmentMax: Math.max(2, Math.min(8, value)) }))} /></label>
+                <label><span>每击预算</span><NumericInput value={rigidFractureParameters.maxFragmentsPerImpact} min={2} max={8} integer onValueChange={(value) => setRigidFractureParameters((current) => ({ ...current, maxFragmentsPerImpact: Math.max(2, Math.min(8, value)) }))} /></label>
+                <label><span>家族预算</span><NumericInput value={rigidFractureParameters.maxActiveFragmentsPerFamily} min={4} max={256} integer onValueChange={(value) => setRigidFractureParameters((current) => ({ ...current, maxActiveFragmentsPerFamily: Math.max(4, Math.min(256, value)) }))} /></label>
+                <label><span>最小面积px²</span><NumericInput value={rigidFractureParameters.minimumFragmentArea} min={1} max={100000} onValueChange={(value) => setRigidFractureParameters((current) => ({ ...current, minimumFragmentArea: Math.max(1, value) }))} /></label>
+                <label><span>最小宽度px</span><NumericInput value={rigidFractureParameters.minimumFragmentWidth} min={1} max={1024} onValueChange={(value) => setRigidFractureParameters((current) => ({ ...current, minimumFragmentWidth: Math.max(1, value) }))} /></label>
+                <label><span>裂纹分支最少</span><NumericInput value={rigidFractureParameters.crackBranchMin} min={0} max={16} integer onValueChange={(value) => setRigidFractureParameters((current) => ({ ...current, crackBranchMin: Math.max(0, Math.min(16, value)) }))} /></label>
+                <label><span>裂纹分支最多</span><NumericInput value={rigidFractureParameters.crackBranchMax} min={0} max={16} integer onValueChange={(value) => setRigidFractureParameters((current) => ({ ...current, crackBranchMax: Math.max(0, Math.min(16, value)) }))} /></label>
+                <label><span>释放延迟tick</span><NumericInput value={rigidFractureParameters.releaseDelayTicks} min={0} max={120} integer onValueChange={(value) => setRigidFractureParameters((current) => ({ ...current, releaseDelayTicks: Math.max(0, Math.min(120, value)) }))} /></label>
+                <label title="玩家、投射物或技能造成轻微表面损伤的最低能量"><span>攻击崩边能</span><NumericInput value={rigidFractureParameters.impactChipEnergy} min={0} max={100000} onValueChange={(value) => setRigidFractureParameters((current) => ({ ...current, impactChipEnergy: Math.max(0, value) }))} /></label>
+                <label title="单次攻击直接显示裂纹的最低能量；较弱攻击也可通过长期疲劳达到裂纹阶段"><span>攻击裂纹能</span><NumericInput value={rigidFractureParameters.impactCrackEnergy} min={0} max={100000} onValueChange={(value) => setRigidFractureParameters((current) => ({ ...current, impactCrackEnergy: Math.max(0, value) }))} /></label>
+                <label title="攻击进入结构破坏级别的能量；仍需累计结构损伤，普通情况下不会首击直接碎裂"><span>攻击断裂能</span><NumericInput value={rigidFractureParameters.impactBreakEnergy} min={0} max={100000} onValueChange={(value) => setRigidFractureParameters((current) => ({ ...current, impactBreakEnergy: Math.max(0, value) }))} /></label>
+                <label title="两个动态刚体互相撞击时进入断裂级别的能量"><span>碰撞断裂阈值</span><NumericInput value={rigidFractureParameters.collisionBreakThreshold} min={0} max={100000} onValueChange={(value) => setRigidFractureParameters((current) => ({ ...current, collisionBreakThreshold: Math.max(0, value) }))} /></label>
+                <label><span>落地崩边能</span><NumericInput value={rigidFractureParameters.landingChipEnergy} min={0} max={100000} onValueChange={(value) => setRigidFractureParameters((current) => ({ ...current, landingChipEnergy: Math.max(0, value) }))} /></label>
+                <label><span>落地裂纹能</span><NumericInput value={rigidFractureParameters.landingCrackEnergy} min={0} max={100000} onValueChange={(value) => setRigidFractureParameters((current) => ({ ...current, landingCrackEnergy: Math.max(0, value) }))} /></label>
+                <label><span>落地断裂能</span><NumericInput value={rigidFractureParameters.landingBreakEnergy} min={0} max={100000} onValueChange={(value) => setRigidFractureParameters((current) => ({ ...current, landingBreakEnergy: Math.max(0, value) }))} /></label>
+                <label title="尖角、小接触面会放大损伤；金属通常较低，脆性冰通常较高"><span>应力敏感度</span><NumericInput value={rigidFractureParameters.contactStressSensitivity} min={0} max={4} onValueChange={(value) => setRigidFractureParameters((current) => ({ ...current, contactStressSensitivity: Math.max(0, Math.min(4, value)) }))} /></label>
+                <label><span>落地冷却tick</span><NumericInput value={rigidFractureParameters.landingCooldownTicks} min={0} max={120} integer onValueChange={(value) => setRigidFractureParameters((current) => ({ ...current, landingCooldownTicks: Math.max(0, Math.min(120, value)) }))} /></label>
+              </div></details>
             </>}
           </div>
         </div>
@@ -1529,16 +2673,17 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
           <canvas ref={canvasRef} onPointerDown={startPointer} onPointerMove={movePointer} onPointerUp={endPointer} onPointerCancel={endPointer} onWheel={zoomCanvas} onContextMenu={(event) => event.preventDefault()} />
           {!editingAsset && !backgroundAsset && <div className="preview-empty"><strong>等待地图背景</strong><span>{project.width}×{project.height}</span></div>}
           {editingAsset && <div className="map-asset-edit-badge"><Pencil size={13} /><span><strong>物体轮廓模板</strong>{editingAsset.name}</span></div>}
+          {mode === "iceBody" && <div className={`map-ice-authoring-hint${icePreview && !icePreview.ok ? " error" : ""}`}><Snowflake size={14} /><span>{drawing && icePreview ? icePreview.message : editingAsset ? "在素材图片上画出唯一的完整闭合程序刚体轮廓" : iceClosureMode === "terrain" ? `从同一条实体地形起笔并落笔 · 可借用 ${iceTerrainContours.length} 条轮廓` : "按住鼠标画出程序刚体边界，松开后自动闭合"}</span><small>模板只提供物理和美术默认值；元素标签由游戏自行解释</small></div>}
         </div>
         <div className="map-canvas-status"><span>{modes.find((item) => item.value === mode)?.label} · {documentWidth}×{documentHeight} · {Math.round(view.zoom * 100)}%</span><span>{editingAsset ? `${editingAsset.name} · ${activeOutlines.length} 条模板轮廓${activeDraftOutlines.length ? ` · ${activeDraftOutlines.length} 条草稿` : ""}` : `${project.objects.length} 个物体 · ${project.outlines.length} 条地图轮廓${project.draftOutlines.length ? ` · ${project.draftOutlines.length} 条草稿` : ""}`}</span></div>
       </main>
 
       <aside className="map-inspector">
         <section className="inspector-section map-object-inspector">
-          <div className="section-heading"><div><strong>{editingAsset ? "物体轮廓模板" : "物体属性"}</strong><span>{editingAsset ? "素材级" : selectedObject ? `${project.objects.findIndex((item) => item.id === selectedObject.id) + 1}/${project.objects.length}` : "未选择"}</span></div>{!editingAsset && selectedObject && <button type="button" className="icon-button small danger" title="删除物体 Delete" onClick={removeSelectedObject}><Trash2 size={14} /></button>}</div>
-          {editingAsset ? <>
+          <div className="section-heading"><div><strong>{editingAsset && !selectedOutline ? "物体轮廓模板" : "选中对象"}</strong><span>{selectedObject ? `贴图物体 ${project.objects.findIndex((item) => item.id === selectedObject.id) + 1}/${project.objects.length}` : selectedOutline ? selectionOutlineLabel(selectedOutline) : selectedMatterStroke ? `${selectedMatterStroke.carrier === "gas" ? "气体" : "液体"}画笔` : editingAsset ? "素材级" : "未选择"}</span></div>{selectedCanvasKind && <button type="button" className="icon-button small danger" title="删除选中对象 Delete" onClick={removeSelectedCanvasTarget}><Trash2 size={14} /></button>}</div>
+          {editingAsset && !selectedOutline ? <>
             <div className="map-selected-preview"><img src={editingAsset.url} alt="" /><div><strong>{editingAsset.name}</strong><span>{editingAsset.width}×{editingAsset.height}</span></div></div>
-            <div className="map-asset-template-help">在中间画布直接绘制。碰撞轮廓会进入 Unity 的地面碰撞层，遮挡轮廓会进入遮挡层；地图中所有使用这张素材的物体都会继承模板，并随实例缩放、旋转和移动。</div>
+            <div className="map-asset-template-help">在中间画布直接绘制。碰撞轮廓进入地面层，程序刚体使用唯一闭合轮廓，遮挡轮廓进入遮挡层；使用该素材的实例会继承同一套外观、物理和破碎参数。</div>
           </> : selectedObject && selectedObjectAsset ? <>
             <div className="map-selected-preview"><img src={selectedObjectAsset.url} alt="" /><div><strong>{selectedObjectAsset.name}</strong><span>{layerLabels[selectedObject.layer]}</span></div></div>
             <div className="map-inspector-label">变换</div>
@@ -1554,8 +2699,180 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
              </div>}
              <div className="map-inspector-label">图层轮廓</div>
             <label className="field"><span>图层</span><select value={selectedObject.layer} onChange={(event) => patchSelectedObject({ layer: event.target.value as MapLayer })}>{Object.entries(layerLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-            <label className="field"><span>透明轮廓精度</span><select value={selectedObject.outlinePrecision} onChange={(event) => patchSelectedObject({ outlinePrecision: event.target.value as OutlinePrecision })}>{Object.entries(precisionLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-          </> : <div className="inspector-empty"><MousePointer2 size={24} /><strong>未选择物体</strong></div>}
+            {selectedObject.layer === "rigid" && (selectedObjectRigidOutline?.rigidBody
+              ? <label className="field"><span>元素标签（素材级）</span><DeferredTextInput value={selectedObjectRigidOutline.rigidBody.elementTag} onValueChange={patchSelectedAssetRigidTag} /></label>
+              : <label className="field"><span>元素标签</span><DeferredTextInput value={selectedObject.elementTag} onValueChange={(elementTag) => patchSelectedObject({ elementTag })} /></label>)}
+          </> : selectedOutline && selectedOutlineBounds ? <>
+            <div className="map-selection-summary">
+              <span className="map-selection-icon" style={{ color: selectedOutline.rigidBody ? selectedOutline.rigidBody.visual.baseColor : selectedOutline.layer === "occlusion" ? layerColors.occlusion : layerColors.collision }}>
+                {selectedOutline.rigidBody ? <Snowflake size={19} /> : selectedOutline.shape === "groundLine" ? <Box size={19} /> : <Eye size={19} />}
+              </span>
+              <div><strong>{selectionOutlineLabel(selectedOutline)}</strong><span>{selectedOutline.points.length} 个点 · {Math.round(selectedOutlineBounds.right - selectedOutlineBounds.left)}×{Math.round(selectedOutlineBounds.bottom - selectedOutlineBounds.top)}px</span></div>
+            </div>
+            <div className="map-inspector-label">位置</div>
+            <div className="field-grid two-columns">
+              <label className="field"><span>中心 X</span><NumericInput value={selectedOutlineBounds.centerX} step={1} onValueChange={(value) => moveSelectedOutlineCenter(value, selectedOutlineBounds.centerY)} /></label>
+              <label className="field"><span>中心 Y</span><NumericInput value={selectedOutlineBounds.centerY} step={1} onValueChange={(value) => moveSelectedOutlineCenter(selectedOutlineBounds.centerX, value)} /></label>
+            </div>
+            {selectedOutline.rigidBody ? <>
+              <div className="map-inspector-label">基本参数</div>
+              <label className="field"><span>模板</span><select value={selectedOutline.rigidBody.templateId} onChange={(event) => {
+                const templateId = event.target.value as ProceduralRigidTemplateId;
+                patchSelectedOutline((outline) => outline.rigidBody ? { ...outline, rigidBody: { ...outline.rigidBody, templateId, visual: { ...outline.rigidBody.visual, templateId } } } : outline);
+              }}>{Object.values(PROCEDURAL_RIGID_TEMPLATES).map((template) => <option key={template.id} value={template.id}>{template.label}</option>)}</select></label>
+              <label className="field"><span>元素标签</span><DeferredTextInput value={selectedOutline.rigidBody.elementTag} onValueChange={(elementTag) => patchSelectedOutline((outline) => outline.rigidBody ? { ...outline, rigidBody: { ...outline.rigidBody, elementTag } } : outline)} /></label>
+              <div className="field-grid two-columns">
+                <label className="field"><span>外观来源</span><select value={selectedOutline.rigidBody.visual.sourceMode} disabled><option value="procedural">程序生成</option><option value="sourceImage">原始图片</option></select></label>
+                <label className="field"><span>封边</span><select value={selectedOutline.rigidBody.closureMode} disabled={Boolean(editingAsset)} onChange={(event) => patchSelectedOutline((outline) => outline.rigidBody ? { ...outline, rigidBody: { ...outline.rigidBody, closureMode: event.target.value as IceBodyClosureMode } } : outline)}><option value="manual">完整手绘</option><option value="terrain">借地形闭合</option></select></label>
+              </div>
+              {selectedOutline.rigidBody.closureMode === "terrain" && <label className="field"><span>地形路径</span><select value={selectedOutline.rigidBody.routePreference || "shorter"} onChange={(event) => patchSelectedOutline((outline) => outline.rigidBody ? { ...outline, rigidBody: { ...outline.rigidBody, routePreference: event.target.value as ProceduralRigidTerrainRoutePreference } } : outline)}><option value="shorter">较短侧</option><option value="alternate">另一侧</option></select></label>}
+              <div className="field-grid two-columns">
+                <label className="field"><span>纹理种子</span><NumericInput value={selectedOutline.rigidBody.seed} min={1} max={4294967295} integer onValueChange={(value) => patchSelectedOutline((outline) => outline.rigidBody ? { ...outline, rigidBody: { ...outline.rigidBody, seed: Math.max(1, Math.floor(value)) >>> 0 || 1 } } : outline)} /></label>
+                <label className="field"><span>分面数量</span><NumericInput value={selectedOutline.rigidBody.facets.length} onValueChange={() => {}} min={0} integer disabled /></label>
+              </div>
+              <details className="map-selection-details" open><summary>外观参数</summary><div>
+                <div className="field-grid three-columns">
+                  <label className="field"><span>基础色</span><input type="color" value={selectedOutline.rigidBody.visual.baseColor} onChange={(event) => patchSelectedRigidVisual({ baseColor: event.target.value })} /></label>
+                  <label className="field"><span>暗部色</span><input type="color" value={selectedOutline.rigidBody.visual.shadowColor} onChange={(event) => patchSelectedRigidVisual({ shadowColor: event.target.value })} /></label>
+                  <label className="field"><span>高光色</span><input type="color" value={selectedOutline.rigidBody.visual.highlightColor} onChange={(event) => patchSelectedRigidVisual({ highlightColor: event.target.value })} /></label>
+                </div>
+                <div className="field-grid two-columns">
+                  <label className="field"><span>边缘色</span><input type="color" value={selectedOutline.rigidBody.visual.edgeColor} onChange={(event) => patchSelectedRigidVisual({ edgeColor: event.target.value })} /></label>
+                  <label className="field"><span>破碎特效色</span><input type="color" value={selectedOutline.rigidBody.visual.fractureColor} onChange={(event) => patchSelectedRigidVisual({ fractureColor: event.target.value })} /></label>
+                </div>
+                <div className="field-grid two-columns">
+                  <label className="field"><span>不透明度（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.visual.opacity * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidVisual({ opacity: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                  <label className="field"><span>边缘锯齿（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.visual.edgeJaggedness * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidVisual({ edgeJaggedness: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                </div>
+                <div className="field-grid two-columns">
+                  <label className="field"><span>分面尺寸</span><NumericInput value={selectedOutline.rigidBody.visual.facetScale} min={6} max={128} integer onValueChange={(value) => patchSelectedRigidVisual({ facetScale: Math.max(6, Math.min(128, value)) })} /></label>
+                  <label className="field"><span>分面变化（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.visual.facetVariation * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidVisual({ facetVariation: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                </div>
+                <div className="field-grid two-columns">
+                  <label className="field"><span>纹理强度（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.visual.textureStrength * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidVisual({ textureStrength: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                  <label className="field"><span>边缘亮度（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.visual.edgeBrightness * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidVisual({ edgeBrightness: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                </div>
+                <label className="field"><span>边缘宽度（px）</span><NumericInput value={selectedOutline.rigidBody.visual.edgeWidthPixels} min={0} max={24} onValueChange={(value) => patchSelectedRigidVisual({ edgeWidthPixels: Math.max(0, Math.min(24, value)) })} /></label>
+                <div className="field-grid two-columns">
+                  <label className="field"><span>体积感（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.visual.volumeDepth * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidVisual({ volumeDepth: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                  <label className="field"><span>透光率（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.visual.transmission * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidVisual({ transmission: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                </div>
+                <div className="field-grid two-columns">
+                  <label className="field"><span>吸收率（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.visual.absorption * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidVisual({ absorption: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                  <label className="field"><span>粗糙度（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.visual.roughness * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidVisual({ roughness: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                </div>
+                <div className="field-grid two-columns">
+                  <label className="field"><span>高光强度（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.visual.specularStrength * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidVisual({ specularStrength: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                  <label className="field"><span>夹杂密度（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.visual.inclusionDensity * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidVisual({ inclusionDensity: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                </div>
+                <label className="field"><span>微裂纹密度（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.visual.microCrackDensity * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidVisual({ microCrackDensity: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                <div className="field-grid three-columns">
+                  <label className="field"><span>纹理方向（°）</span><NumericInput value={selectedOutline.rigidBody.visual.grainDirectionDegrees} min={-180} max={180} onValueChange={(value) => patchSelectedRigidVisual({ grainDirectionDegrees: Math.max(-180, Math.min(180, value)) })} /></label>
+                  <label className="field"><span>方向性（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.visual.anisotropy * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidVisual({ anisotropy: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                  <label className="field"><span>光照方向（°）</span><NumericInput value={selectedOutline.rigidBody.visual.lightAngleDegrees} min={-180} max={180} onValueChange={(value) => patchSelectedRigidVisual({ lightAngleDegrees: Math.max(-180, Math.min(180, value)) })} /></label>
+                </div>
+              </div></details>
+              <details className="map-selection-details" open><summary>物理参数</summary><div>
+                <label className="field"><span>锚定模式</span><select value={selectedOutline.rigidBody.physical.anchoringMode} onChange={(event) => patchSelectedRigidPhysical({ anchoringMode: event.target.value as ProceduralRigidPhysicalAuthoringData["anchoringMode"] })}><option value="dynamic">动态</option><option value="fixed">固定</option><option value="terrainAttached">附着地形</option></select></label>
+                <div className="field-grid two-columns">
+                  <label className="field"><span>密度</span><NumericInput value={selectedOutline.rigidBody.physical.density} min={0.001} max={100} onValueChange={(value) => patchSelectedRigidPhysical({ density: Math.max(0.001, Math.min(100, value)) })} /></label>
+                  <label className="field"><span>重力倍率</span><NumericInput value={selectedOutline.rigidBody.physical.gravityScale} min={-8} max={8} onValueChange={(value) => patchSelectedRigidPhysical({ gravityScale: Math.max(-8, Math.min(8, value)) })} /></label>
+                </div>
+                <div className="field-grid two-columns">
+                  <label className="field"><span>摩擦力（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.physical.friction * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidPhysical({ friction: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                  <label className="field"><span>弹性（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.physical.restitution * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidPhysical({ restitution: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                </div>
+                <div className="field-grid two-columns">
+                  <label className="field"><span>线性阻尼</span><NumericInput value={selectedOutline.rigidBody.physical.linearDamping} min={0} max={20} onValueChange={(value) => patchSelectedRigidPhysical({ linearDamping: Math.max(0, Math.min(20, value)) })} /></label>
+                  <label className="field"><span>旋转阻尼</span><NumericInput value={selectedOutline.rigidBody.physical.angularDamping} min={0} max={20} onValueChange={(value) => patchSelectedRigidPhysical({ angularDamping: Math.max(0, Math.min(20, value)) })} /></label>
+                </div>
+                <div className="field-grid three-columns">
+                  <label className="field"><span>硬度（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.physical.hardness * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidPhysical({ hardness: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                  <label className="field"><span>韧性（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.physical.toughness * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidPhysical({ toughness: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                  <label className="field"><span>脆性（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.physical.brittleness * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidPhysical({ brittleness: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                </div>
+                <div className="field-grid two-columns">
+                  <label className="field"><span>各向异性（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.physical.anisotropy * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidPhysical({ anisotropy: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+                  <label className="field"><span>材料纹向（°）</span><NumericInput value={selectedOutline.rigidBody.physical.grainAngleDegrees} min={-180} max={180} onValueChange={(value) => patchSelectedRigidPhysical({ grainAngleDegrees: Math.max(-180, Math.min(180, value)) })} /></label>
+                </div>
+                <label className="field"><span>碎屑比例（%）</span><NumericInput value={Math.round(selectedOutline.rigidBody.physical.debrisFraction * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedRigidPhysical({ debrisFraction: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+              </div></details>
+              <details className="map-selection-details" open><summary>破碎参数</summary><div>
+                <div className="field-grid two-columns">
+                  <label className="field"><span>主碎片最少</span><NumericInput value={selectedOutline.rigidBody.fracture.primaryFragmentMin} min={2} max={8} integer onValueChange={(value) => patchSelectedRigidFracture({ primaryFragmentMin: Math.max(2, Math.min(8, value)) })} /></label>
+                  <label className="field"><span>主碎片最多</span><NumericInput value={selectedOutline.rigidBody.fracture.primaryFragmentMax} min={2} max={8} integer onValueChange={(value) => patchSelectedRigidFracture({ primaryFragmentMax: Math.max(2, Math.min(8, value)) })} /></label>
+                </div>
+                <div className="field-grid two-columns">
+                  <label className="field"><span>每次冲击碎片上限</span><NumericInput value={selectedOutline.rigidBody.fracture.maxFragmentsPerImpact} min={2} max={8} integer onValueChange={(value) => patchSelectedRigidFracture({ maxFragmentsPerImpact: Math.max(2, Math.min(8, value)) })} /></label>
+                  <label className="field"><span>同源碎片上限</span><NumericInput value={selectedOutline.rigidBody.fracture.maxActiveFragmentsPerFamily} min={4} max={256} integer onValueChange={(value) => patchSelectedRigidFracture({ maxActiveFragmentsPerFamily: Math.max(4, Math.min(256, value)) })} /></label>
+                </div>
+                <div className="field-grid two-columns">
+                  <label className="field"><span>最小碎片面积（px²）</span><NumericInput value={selectedOutline.rigidBody.fracture.minimumFragmentArea} min={1} max={100000} onValueChange={(value) => patchSelectedRigidFracture({ minimumFragmentArea: Math.max(1, value) })} /></label>
+                  <label className="field"><span>最小碎片宽度（px）</span><NumericInput value={selectedOutline.rigidBody.fracture.minimumFragmentWidth} min={1} max={1024} onValueChange={(value) => patchSelectedRigidFracture({ minimumFragmentWidth: Math.max(1, value) })} /></label>
+                </div>
+                <div className="field-grid two-columns">
+                  <label className="field"><span>裂纹分支最少</span><NumericInput value={selectedOutline.rigidBody.fracture.crackBranchMin} min={0} max={16} integer onValueChange={(value) => patchSelectedRigidFracture({ crackBranchMin: Math.max(0, Math.min(16, value)) })} /></label>
+                  <label className="field"><span>裂纹分支最多</span><NumericInput value={selectedOutline.rigidBody.fracture.crackBranchMax} min={0} max={16} integer onValueChange={(value) => patchSelectedRigidFracture({ crackBranchMax: Math.max(0, Math.min(16, value)) })} /></label>
+                </div>
+                <label className="field"><span>释放延迟（tick）</span><NumericInput value={selectedOutline.rigidBody.fracture.releaseDelayTicks} min={0} max={120} integer onValueChange={(value) => patchSelectedRigidFracture({ releaseDelayTicks: Math.max(0, Math.min(120, value)) })} /></label>
+                <div className="field-grid three-columns">
+                  <label className="field"><span>攻击崩边能量</span><NumericInput value={selectedOutline.rigidBody.fracture.impactChipEnergy} min={0} max={100000} onValueChange={(value) => patchSelectedRigidFracture({ impactChipEnergy: Math.max(0, value) })} /></label>
+                  <label className="field"><span>攻击裂纹能量</span><NumericInput value={selectedOutline.rigidBody.fracture.impactCrackEnergy} min={0} max={100000} onValueChange={(value) => patchSelectedRigidFracture({ impactCrackEnergy: Math.max(0, value) })} /></label>
+                  <label className="field"><span>攻击断裂能量</span><NumericInput value={selectedOutline.rigidBody.fracture.impactBreakEnergy} min={0} max={100000} onValueChange={(value) => patchSelectedRigidFracture({ impactBreakEnergy: Math.max(0, value) })} /></label>
+                </div>
+                <label className="field"><span>碰撞断裂阈值</span><NumericInput value={selectedOutline.rigidBody.fracture.collisionBreakThreshold} min={0} max={100000} onValueChange={(value) => patchSelectedRigidFracture({ collisionBreakThreshold: Math.max(0, value) })} /></label>
+                <div className="field-grid three-columns">
+                  <label className="field"><span>落地崩边能量</span><NumericInput value={selectedOutline.rigidBody.fracture.landingChipEnergy} min={0} max={100000} onValueChange={(value) => patchSelectedRigidFracture({ landingChipEnergy: Math.max(0, value) })} /></label>
+                  <label className="field"><span>落地裂纹能量</span><NumericInput value={selectedOutline.rigidBody.fracture.landingCrackEnergy} min={0} max={100000} onValueChange={(value) => patchSelectedRigidFracture({ landingCrackEnergy: Math.max(0, value) })} /></label>
+                  <label className="field"><span>落地断裂能量</span><NumericInput value={selectedOutline.rigidBody.fracture.landingBreakEnergy} min={0} max={100000} onValueChange={(value) => patchSelectedRigidFracture({ landingBreakEnergy: Math.max(0, value) })} /></label>
+                </div>
+                <div className="field-grid two-columns">
+                  <label className="field"><span>应力敏感度</span><NumericInput value={selectedOutline.rigidBody.fracture.contactStressSensitivity} min={0} max={4} onValueChange={(value) => patchSelectedRigidFracture({ contactStressSensitivity: Math.max(0, Math.min(4, value)) })} /></label>
+                  <label className="field"><span>落地冷却（tick）</span><NumericInput value={selectedOutline.rigidBody.fracture.landingCooldownTicks} min={0} max={120} integer onValueChange={(value) => patchSelectedRigidFracture({ landingCooldownTicks: Math.max(0, Math.min(120, value)) })} /></label>
+                </div>
+              </div></details>
+            </> : selectedOutline.shape === "groundLine" ? <>
+              <div className="map-inspector-label">碰撞参数</div>
+              <label className="field"><span>碰撞方向</span><select value={selectedOutline.collisionType} onChange={(event) => patchSelectedOutline((outline) => ({ ...outline, collisionType: event.target.value as MapOutlineData["collisionType"] }))}><option value="solid">双向</option><option value="oneWay">单向</option></select></label>
+              <label className="field checkbox-field"><input type="checkbox" checked={selectedOutline.sideCollision !== false} onChange={(event) => patchSelectedOutline((outline) => ({ ...outline, sideCollision: event.target.checked }))} /><span>启用侧面碰撞</span></label>
+              <label className="field"><span>厚度（px）</span><NumericInput value={selectedOutline.thickness} min={1} max={256} integer onValueChange={(value) => patchSelectedOutline((outline) => { const thickness = Math.max(1, Math.min(256, value)); return { ...outline, thickness, points: createGroundLinePoints(outline.points[0], outline.points[1], thickness) }; })} /></label>
+            </> : selectedOutline.layer === "collision" ? <>
+              <div className="map-inspector-label">碰撞参数</div>
+              <label className="field"><span>碰撞类型</span><select value={selectedOutline.collisionType} onChange={(event) => patchSelectedOutline((outline) => ({ ...outline, collisionType: event.target.value as MapOutlineData["collisionType"] }))}><option value="solid">实体</option><option value="oneWay">单向穿透</option><option value="trigger">触发区</option></select></label>
+            </> : <div className="map-asset-template-help">遮挡区域会按当前闭合轮廓同步到 Unity。可以修改中心位置，需要更换形状时删除后重新绘制。</div>}
+          </> : selectedMatterStroke && selectedMatterBounds ? <>
+            <div className="map-selection-summary">
+              <span className="map-selection-icon" style={{ color: selectedMatterStroke.profile.visual.baseColor }}><CircleDot size={19} /></span>
+              <div><strong>{selectedMatterStroke.elementTag || "未命名"} · {selectedMatterStroke.carrier === "gas" ? "气体" : "液体"}</strong><span>{selectedMatterStroke.points.length} 个点 · 画笔半径 {Math.round(selectedMatterStroke.radius)}px</span></div>
+            </div>
+            <div className="map-inspector-label">基本参数</div>
+            <label className="field"><span>相态</span><select value={selectedMatterStroke.carrier} onChange={(event) => { const carrier = event.target.value as MapMatterStrokeData["carrier"]; patchSelectedMatterStroke((stroke) => ({ ...stroke, carrier, profile: normalizeMatterProfile(carrier, stroke.elementTag, stroke.profile) })); }}><option value="liquid">液体</option><option value="gas">气体</option></select></label>
+            <label className="field"><span>元素标签</span><DeferredTextInput value={selectedMatterStroke.elementTag} onValueChange={(elementTag) => patchSelectedMatterStroke((stroke) => ({ ...stroke, elementTag: elementTag.trim() || "untagged" }))} /></label>
+            <div className="field-grid two-columns">
+              <label className="field"><span>中心 X</span><NumericInput value={selectedMatterBounds.centerX} step={1} onValueChange={(value) => moveSelectedMatterCenter(value, selectedMatterBounds.centerY)} /></label>
+              <label className="field"><span>中心 Y</span><NumericInput value={selectedMatterBounds.centerY} step={1} onValueChange={(value) => moveSelectedMatterCenter(selectedMatterBounds.centerX, value)} /></label>
+            </div>
+            <label className="field"><span>画笔半径（px）</span><NumericInput value={selectedMatterStroke.radius} min={1} max={256} integer onValueChange={(value) => patchSelectedMatterStroke((stroke) => ({ ...stroke, radius: Math.max(1, Math.min(256, value)) }))} /></label>
+            <details className="map-selection-details" open><summary>外观参数</summary><div>
+              <div className="field-grid three-columns"><label className="field"><span>基础色</span><input type="color" value={selectedMatterStroke.profile.visual.baseColor} onChange={(event) => patchSelectedMatterVisual({ baseColor: event.target.value })} /></label><label className="field"><span>次级色</span><input type="color" value={selectedMatterStroke.profile.visual.secondaryColor} onChange={(event) => patchSelectedMatterVisual({ secondaryColor: event.target.value })} /></label><label className="field"><span>发光色</span><input type="color" value={selectedMatterStroke.profile.visual.emissionColor} onChange={(event) => patchSelectedMatterVisual({ emissionColor: event.target.value })} /></label></div>
+              <label className="field"><span>不透明度（%）</span><NumericInput value={Math.round(selectedMatterStroke.profile.visual.opacity * 100)} min={0} max={100} integer onValueChange={(value) => patchSelectedMatterVisual({ opacity: Math.max(0, Math.min(100, value)) / 100 })} /></label>
+              <div className="field-grid two-columns"><label className="field"><span>粒子尺寸</span><NumericInput value={selectedMatterStroke.profile.visual.particleScale} min={0.1} max={4} step={0.05} onValueChange={(value) => patchSelectedMatterVisual({ particleScale: Math.max(0.1, Math.min(4, value)) })} /></label><label className="field"><span>边缘柔化</span><NumericInput value={selectedMatterStroke.profile.visual.edgeSoftness} min={0} max={1} step={0.05} onValueChange={(value) => patchSelectedMatterVisual({ edgeSoftness: Math.max(0, Math.min(1, value)) })} /></label></div>
+              <div className="field-grid two-columns"><label className="field"><span>细节尺度</span><NumericInput value={selectedMatterStroke.profile.visual.detailScale} min={0.1} max={8} step={0.1} onValueChange={(value) => patchSelectedMatterVisual({ detailScale: Math.max(0.1, Math.min(8, value)) })} /></label><label className="field"><span>折射强度</span><NumericInput value={selectedMatterStroke.profile.visual.refractionStrength} min={0} max={1} step={0.05} onValueChange={(value) => patchSelectedMatterVisual({ refractionStrength: Math.max(0, Math.min(1, value)) })} /></label></div>
+              <div className="field-grid two-columns"><label className="field"><span>发光强度</span><NumericInput value={selectedMatterStroke.profile.visual.glowStrength} min={0} max={8} step={0.1} onValueChange={(value) => patchSelectedMatterVisual({ glowStrength: Math.max(0, Math.min(8, value)) })} /></label>{selectedMatterStroke.carrier === "liquid" && <label className="field"><span>泡沫量</span><NumericInput value={selectedMatterStroke.profile.visual.foamAmount} min={0} max={1} step={0.05} onValueChange={(value) => patchSelectedMatterVisual({ foamAmount: Math.max(0, Math.min(1, value)) })} /></label>}</div>
+            </div></details>
+            <details className="map-selection-details" open><summary>物理参数</summary><div>
+              <label className="field"><span>密度</span><NumericInput value={selectedMatterStroke.profile.physical.density} min={0.001} max={100} step={0.05} onValueChange={(value) => patchSelectedMatterPhysical({ density: Math.max(0.001, Math.min(100, value)) })} /></label>
+              {selectedMatterStroke.carrier === "liquid" ? <>
+                <div className="field-grid two-columns"><label className="field"><span>黏度</span><NumericInput value={selectedMatterStroke.profile.physical.viscosity} min={0} max={8} step={0.05} onValueChange={(value) => patchSelectedMatterPhysical({ viscosity: Math.max(0, Math.min(8, value)) })} /></label><label className="field"><span>表面张力</span><NumericInput value={selectedMatterStroke.profile.physical.surfaceTension} min={0} max={4} step={0.05} onValueChange={(value) => patchSelectedMatterPhysical({ surfaceTension: Math.max(0, Math.min(4, value)) })} /></label></div>
+                <div className="field-grid two-columns"><label className="field"><span>流动速度</span><NumericInput value={selectedMatterStroke.profile.physical.flowSpeed} min={0.05} max={8} step={0.05} onValueChange={(value) => patchSelectedMatterPhysical({ flowSpeed: Math.max(0.05, Math.min(8, value)) })} /></label><label className="field"><span>重力倍率</span><NumericInput value={selectedMatterStroke.profile.physical.gravityScale} min={-4} max={4} step={0.05} onValueChange={(value) => patchSelectedMatterPhysical({ gravityScale: Math.max(-4, Math.min(4, value)) })} /></label></div>
+                <label className="field"><span>蒸发半衰期（秒）</span><NumericInput value={selectedMatterStroke.profile.physical.evaporationHalfLifeSeconds} min={0} max={86400} step={10} onValueChange={(value) => patchSelectedMatterPhysical({ evaporationHalfLifeSeconds: Math.max(0, Math.min(86400, value)) })} /></label>
+              </> : <>
+                <div className="field-grid two-columns"><label className="field"><span>浮力</span><NumericInput value={selectedMatterStroke.profile.physical.buoyancy} min={-4} max={4} step={0.05} onValueChange={(value) => patchSelectedMatterPhysical({ buoyancy: Math.max(-4, Math.min(4, value)) })} /></label><label className="field"><span>扩散率</span><NumericInput value={selectedMatterStroke.profile.physical.diffusion} min={0} max={4} step={0.05} onValueChange={(value) => patchSelectedMatterPhysical({ diffusion: Math.max(0, Math.min(4, value)) })} /></label></div>
+                <label className="field"><span>阻力</span><NumericInput value={selectedMatterStroke.profile.physical.drag} min={0} max={8} step={0.05} onValueChange={(value) => patchSelectedMatterPhysical({ drag: Math.max(0, Math.min(8, value)) })} /></label>
+                <label className="field"><span>消散半衰期（秒）</span><NumericInput value={selectedMatterStroke.profile.physical.dissipationHalfLifeSeconds} min={0} max={86400} step={10} onValueChange={(value) => patchSelectedMatterPhysical({ dissipationHalfLifeSeconds: Math.max(0, Math.min(86400, value)) })} /></label>
+              </>}
+            </div></details>
+          </> : <div className="inspector-empty"><MousePointer2 size={24} /><strong>点击画布对象进行选择</strong></div>}
         </section>
         <section className="inspector-section map-outline-section">
           <div className="section-heading"><div><strong>{editingAsset ? "物体模板轮廓" : "地图轮廓"}</strong><span>{activeOutlines.length} 条{activeDraftOutlines.length ? ` · ${activeDraftOutlines.length} 条草稿` : ""}</span></div></div>
@@ -1566,10 +2883,30 @@ export default function MapEditor({ onSwitchToCharacter, onSwitchToEnemy }: MapE
           </div>
           <div className="map-outline-list">
             {!activeOutlines.length && !activeDraftOutlines.length && <div className="list-empty">{editingAsset ? "暂无物体模板轮廓" : "暂无地图轮廓"}</div>}
-            {activeOutlines.map((outline) => { const style = outline.shape === "groundLine" ? rectangleCollisionStyle(outline.collisionType, outline.sideCollision !== false) : null; return <div className="map-outline-item" key={outline.id}><CircleDot size={13} style={{ color: outline.layer === "occlusion" ? layerColors.occlusion : style?.stroke || layerColors.collision }} /><span><strong>{outline.layer === "occlusion" ? "遮挡区域" : outline.shape === "groundLine" ? "矩形碰撞" : "实体碰撞"}</strong><small>{outline.shape === "groundLine" ? `${rectangleCollisionLabel(outline.collisionType, outline.sideCollision !== false)} · ${Math.round(outline.thickness)}px` : `${outline.points.length} 点`}</small></span><button type="button" title="删除轮廓" onClick={() => deleteOutline(outline.id)}><X size={13} /></button></div>; })}
-            {activeDraftOutlines.map((outline) => <div className="map-outline-item draft" key={outline.id}><Pencil size={13} style={{ color: outline.layer === "occlusion" ? layerColors.occlusion : layerColors.collision }} /><span><strong>{outline.layer === "occlusion" ? "遮挡草稿" : "碰撞草稿"}</strong><small>{outline.points.length} 点 · 未闭合</small></span><button type="button" title="删除草稿" onClick={() => deleteDraftOutline(outline.id)}><X size={13} /></button></div>)}
+            {activeOutlines.map((outline) => {
+              const style = outline.shape === "groundLine" ? rectangleCollisionStyle(outline.collisionType, outline.sideCollision !== false) : null;
+              const color = outline.rigidBody ? outline.rigidBody.visual.baseColor : outline.layer === "occlusion" ? layerColors.occlusion : outline.layer === "rigid" ? elementColors[outline.element] : style?.stroke || layerColors.collision;
+              const convertibleRigid = !outline.rigidBody && outline.layer === "rigid" && outline.closed && outline.points.length >= 3;
+              return <div className={`map-outline-item${selectedOutlineId === outline.id ? " selected" : ""}`} key={outline.id} onClick={() => selectCanvasTarget("outline", outline.id)}>
+                {outline.rigidBody ? <Snowflake size={13} style={{ color }} /> : <CircleDot size={13} style={{ color }} />}
+                <span><strong>{outline.rigidBody ? `${PROCEDURAL_RIGID_TEMPLATES[outline.rigidBody.templateId].label}程序刚体` : outline.layer === "occlusion" ? "遮挡区域" : outline.layer === "rigid" ? "程序刚体（待迁移）" : outline.shape === "groundLine" ? "矩形碰撞" : "实体碰撞"}</strong><small>{outline.rigidBody ? `${outline.rigidBody.closureMode === "terrain" ? "借地形" : "完整手绘"} · 标签 ${outline.rigidBody.elementTag || "无"} · ${outline.rigidBody.facets.length} 分面 · Seed ${outline.rigidBody.seed}` : outline.shape === "groundLine" ? `${rectangleCollisionLabel(outline.collisionType, outline.sideCollision !== false)} · ${Math.round(outline.thickness)}px` : `${outline.points.length} 点`}</small></span>
+                <div className="map-outline-item-actions">
+                  {outline.rigidBody && <button type="button" className={editingRigidOutlineId === outline.id ? "active" : ""} title="载入并编辑程序刚体全部参数" onClick={(event) => { event.stopPropagation(); loadProceduralRigidParameters(outline.id); }}><Pencil size={13} /></button>}
+                  {convertibleRigid && <button type="button" className="map-outline-convert-ice" title="转换为当前模板的程序刚体" onClick={(event) => { event.stopPropagation(); convertOutlineToProgramRigid(outline.id); }}><Snowflake size={13} /></button>}
+                  <button type="button" title="删除轮廓" onClick={(event) => { event.stopPropagation(); deleteOutline(outline.id); }}><X size={13} /></button>
+                </div>
+              </div>;
+            })}
+            {activeDraftOutlines.map((outline) => <div className="map-outline-item draft" key={outline.id}><Pencil size={13} style={{ color: outline.layer === "occlusion" ? layerColors.occlusion : outline.layer === "rigid" ? layerColors.rigid : layerColors.collision }} /><span><strong>{outline.layer === "occlusion" ? "遮挡草稿" : outline.layer === "rigid" ? "程序刚体草稿" : "碰撞草稿"}</strong><small>{outline.points.length} 点 · 未闭合</small></span><button type="button" title="删除草稿" onClick={() => deleteDraftOutline(outline.id)}><X size={13} /></button></div>)}
           </div>
         </section>
+        {!editingAsset && <section className="inspector-section map-outline-section">
+          <div className="section-heading"><div><strong>元素物质</strong><span>{(project.matterStrokes || []).length} 条画笔</span></div></div>
+          <div className="map-outline-list">
+            {!(project.matterStrokes || []).length && <div className="list-empty">暂无液体或气体画笔</div>}
+            {(project.matterStrokes || []).map((stroke) => <div className={`map-outline-item${selectedMatterStrokeId === stroke.id ? " selected" : ""}`} key={stroke.id} onClick={() => selectCanvasTarget("matter", stroke.id)}><CircleDot size={13} style={{ color: stroke.profile.visual.baseColor }} /><span><strong>{stroke.elementTag || "未命名"} · {stroke.carrier === "gas" ? "气体" : "液体"}</strong><small>{stroke.points.length} 点 · 半径 {Math.round(stroke.radius)}px · 密度 {stroke.profile.physical.density}</small></span><button type="button" title="删除画笔" onClick={(event) => { event.stopPropagation(); deleteMatterStroke(stroke.id); }}><X size={13} /></button></div>)}
+          </div>
+        </section>}
       </aside>
     </div>
 

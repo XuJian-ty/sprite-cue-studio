@@ -1,6 +1,6 @@
 {
   "name": "sprite-cue-studio",
-  "version": "0.34.8",
+  "version": "0.35.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,7 +8,9 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "start": "node server.cjs",
-    "test:actor-sync": "node --test tests/actor-sync.test.cjs"
+    "test": "node --test tests/*.test.cjs",
+    "test:actor-sync": "node --test tests/actor-sync.test.cjs",
+    "test:map-matter": "node --test tests/map-matter.test.cjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",

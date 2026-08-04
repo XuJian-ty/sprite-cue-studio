@@ -1,4 +1,5 @@
 import type { MapAssetRef, MapProject } from "./mapTypes";
+import { ensureProgramIceAssets, ensureProgramIceProject } from "./mapIceGeometry";
 
 const DATABASE_NAME = "frame-action-map-studio";
 const DATABASE_VERSION = 2;
@@ -89,25 +90,27 @@ function assetsForStorage(assets: Record<string, MapAssetRef>): Record<string, M
 }
 
 export async function saveMapDraft(project: MapProject, assets: Record<string, MapAssetRef>): Promise<void> {
+  const persistentProject = ensureProgramIceProject(project);
+  const persistentAssets = ensureProgramIceAssets(assets);
   const database = await openDatabase();
   const now = Date.now();
-  const currentAssetSignature = assetSignature(assets);
-  const currentProjectSignature = projectSignature(project);
+  const currentAssetSignature = assetSignature(persistentAssets);
+  const currentProjectSignature = projectSignature(persistentProject);
   const assetsChanged = currentAssetSignature !== persistedAssetSignature;
   const shouldSnapshot = currentProjectSignature !== lastSnapshotSignature && now - lastSnapshotAt >= SNAPSHOT_INTERVAL_MS;
   try {
     const transaction = database.transaction([PROJECT_STORE, SNAPSHOT_STORE], "readwrite");
-    const projectState: StoredProjectState = { project, savedAt: now };
+    const projectState: StoredProjectState = { project: persistentProject, savedAt: now };
     const projects = transaction.objectStore(PROJECT_STORE);
     projects.put(projectState, LAST_DRAFT_KEY);
-    projects.put(projectState, mapKey(project));
+    projects.put(projectState, mapKey(persistentProject));
 
     if (shouldSnapshot) {
       const snapshots = transaction.objectStore(SNAPSHOT_STORE);
-      const request = snapshots.get(mapKey(project));
+      const request = snapshots.get(mapKey(persistentProject));
       request.onsuccess = () => {
         const current = Array.isArray(request.result) ? request.result as StoredProjectSnapshot[] : [];
-        snapshots.put([...current, projectState].slice(-MAX_SNAPSHOTS), mapKey(project));
+        snapshots.put([...current, projectState].slice(-MAX_SNAPSHOTS), mapKey(persistentProject));
       };
     }
 
@@ -121,8 +124,8 @@ export async function saveMapDraft(project: MapProject, assets: Record<string, M
       try {
         const assetTransaction = database.transaction(ASSET_BUNDLE_STORE, "readwrite");
         const bundles = assetTransaction.objectStore(ASSET_BUNDLE_STORE);
-        bundles.put({ project, assets: assetsForStorage(assets), savedAt: now } satisfies StoredAssetBundle, LAST_DRAFT_KEY);
-        bundles.delete(mapKey(project));
+        bundles.put({ project: persistentProject, assets: assetsForStorage(persistentAssets), savedAt: now } satisfies StoredAssetBundle, LAST_DRAFT_KEY);
+        bundles.delete(mapKey(persistentProject));
         await transactionDone(assetTransaction);
       } catch (error) {
         console.warn("[Frame Action Map] 图片资源缓存空间不足，地图结构仍已保存", error);
@@ -143,10 +146,11 @@ export async function loadMapDraft(): Promise<StoredMapDraft | null> {
       requestValue<StoredProjectState>(transaction.objectStore(PROJECT_STORE), LAST_DRAFT_KEY),
     ]);
     await transactionDone(transaction);
-    const project = projectState?.project || bundle?.project;
-    if (!project) return null;
+    const storedProject = projectState?.project || bundle?.project;
+    if (!storedProject) return null;
+    const project = ensureProgramIceProject(storedProject);
     const savedAt = Math.max(bundle?.savedAt || 0, projectState?.savedAt || 0);
-    const assets = bundle?.assets || {};
+    const assets = ensureProgramIceAssets(bundle?.assets || {});
     persistedAssetSignature = assetSignature(assets);
     lastSnapshotSignature = projectSignature(project);
     lastSnapshotAt = savedAt;

@@ -75,6 +75,7 @@ import type {
   TimelineEvent,
   TimelineTrack,
   TrackKind,
+  UnityPropertyCatalogEntry,
 } from "./types";
 import { validateProject, type ValidationIssue } from "./validation";
 import { loadLastProjectDraft, saveLastProjectDraft } from "./projectDraftStore";
@@ -88,6 +89,7 @@ interface EditorLayout {
 
 const DEFAULT_EDITOR_LAYOUT: EditorLayout = { leftPanelWidth: 248, rightPanelWidth: 340, timelineHeight: 294 };
 const ACTOR_ASSET_BASE64_CHUNK_SIZE = 8 * 1024 * 1024;
+const ACTOR_ASSET_BINARY_CHUNK_SIZE = 8 * 1024 * 1024;
 
 function clampLayoutValue(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
@@ -185,6 +187,27 @@ async function sha256Base64DataUrl(
   if (writtenBytes !== info.byteSize) throw new Error("角色资源大小校验失败");
   const digest = new Uint8Array(await window.crypto.subtle.digest("SHA-256", bytes.buffer));
   return Array.from(digest, (item) => item.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256Bytes(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
+  const digest = new Uint8Array(await window.crypto.subtle.digest("SHA-256", bytes.buffer));
+  return Array.from(digest, (item) => item.toString(16).padStart(2, "0")).join("");
+}
+
+async function fetchAssetBytes(asset: AssetRef): Promise<Uint8Array<ArrayBuffer>> {
+  if (!asset.url) throw new Error(`资源“${asset.name}”没有可读取地址`);
+  const response = await fetch(asset.url);
+  if (!response.ok) throw new Error(`读取资源“${asset.name}”失败：${response.status}`);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (!bytes.byteLength) throw new Error(`资源“${asset.name}”内容为空`);
+  return bytes;
+}
+
+async function fetchAssetDataUrl(asset: AssetRef): Promise<string> {
+  if (!asset.url) throw new Error(`资源“${asset.name}”没有可读取地址`);
+  const response = await fetch(asset.url);
+  if (!response.ok) throw new Error(`读取资源“${asset.name}”失败：${response.status}`);
+  return readDataUrl(await response.blob());
 }
 
 function getSheetLayout(value: SheetDialogState) {
@@ -362,6 +385,26 @@ function inferCharacterEntries(project: CharacterProject) {
   project.airIdleId = airIdle?.id || project.groundIdleId;
 }
 
+function normalizeAttributeEffect(value: unknown, nested: boolean) {
+  const source = value && typeof value === "object" ? value as Record<string, any> : {};
+  const references = Array.isArray(source.references) ? source.references : [];
+  const normalized: Record<string, any> = {
+    id: String(source.id || uid("attribute")),
+    propertyId: String(source.propertyId || source.targetPropertyId || ""),
+    fixedValue: Number.isFinite(Number(source.fixedValue)) ? Number(source.fixedValue) : 0,
+    references: references.map((reference: any) => ({
+      id: String(reference?.id || uid("reference")),
+      propertyId: String(reference?.propertyId || ""),
+      percent: Number.isFinite(Number(reference?.percent)) ? Number(reference.percent) : 0,
+      ...(nested ? { referenceObject: reference?.referenceObject === "target" ? "target" : "self" } : {}),
+    })),
+    changeType: source.changeType === "temporary" ? "temporary" : "permanent",
+    durationSeconds: Math.max(0, Number(source.durationSeconds) || 0),
+  };
+  if (nested) normalized.targetObject = source.targetObject === "self" ? "self" : "target";
+  return normalized;
+}
+
 function cleanLegacyProjectData(value: CharacterProject): CharacterProject {
   const project = structuredClone(value);
   const projectRecord = project as CharacterProject & Record<string, unknown>;
@@ -388,7 +431,7 @@ function cleanLegacyProjectData(value: CharacterProject): CharacterProject {
     const jumpIndex = jumpAction ? project.actions.indexOf(jumpAction) : project.actions.length - 1;
     project.actions.splice(jumpIndex + 1, 0, dropThrough);
   }
-  project.version = 11;
+  project.version = 12;
   const defaultMotor = createMotorSettings();
   const legacyMotor = (project.motor || {}) as CharacterProject["motor"] & { walkSpeed?: number; runSpeed?: number; jumpHeight?: number };
   const legacyWalkSpeed = Math.max(0, Number(legacyMotor.walkSpeed) || 4);
@@ -540,15 +583,19 @@ function cleanLegacyProjectData(value: CharacterProject): CharacterProject {
       segment.markers ||= [];
       segment.pixelsPerUnit = Math.max(1, Number(segment.pixelsPerUnit) || project.pixelsPerUnit);
       segment.jumpHeight = Math.max(0.01, Number(segment.jumpHeight) || legacyJumpHeight);
-      segment.tracks = (segment.tracks || []).filter((track) => String(track.kind) !== "attribute");
-      for (const kind of ["damage", "physics", "vfx", "sfx", "speed", "camera"] as TrackKind[]) {
+      segment.tracks = segment.tracks || [];
+      for (const kind of ["damage", "physics", "vfx", "sfx", "attribute", "speed", "camera"] as TrackKind[]) {
         if (!segment.tracks.some((track) => track.kind === kind)) segment.tracks.push(createTrack(kind));
       }
       for (const track of segment.tracks) {
         track.events ||= [];
           for (const timelineEvent of track.events) {
             const params = timelineEvent.params || {};
-            delete params.attributeEffects;
+            timelineEvent.params = params;
+          if (track.kind === "attribute") {
+            params.attributeEffects = (Array.isArray(params.attributeEffects) ? params.attributeEffects : [])
+              .map((effect: unknown) => normalizeAttributeEffect(effect, false));
+          }
           if (track.kind === "vfx") for (const effect of params.vfxEffects || []) normalizeVfxEffect(effect, true, project.pixelsPerUnit);
           if (track.kind === "sfx") for (const effect of params.sfxEffects || []) normalizeSfxEffect(effect, false);
           for (const damageEffect of params.damageEffects || []) {
@@ -586,7 +633,8 @@ function cleanLegacyProjectData(value: CharacterProject): CharacterProject {
             damageEffect.physicalIgnoreCasterTicks = Number.isFinite(Number(damageEffect.physicalIgnoreCasterTicks)) ? Math.max(0, Math.round(Number(damageEffect.physicalIgnoreCasterTicks))) : 30;
             delete damageEffect.physicalInitialVelocityX;
             delete damageEffect.physicalInitialVelocityY;
-            delete damageEffect.onHitAttributeEffects;
+            damageEffect.onHitAttributeEffects = (Array.isArray(damageEffect.onHitAttributeEffects) ? damageEffect.onHitAttributeEffects : [])
+              .map((effect: unknown) => normalizeAttributeEffect(effect, true));
             if (damageEffect.detectionType === "physicalEntity") {
               damageEffect.shape = damageEffect.shape === "circle" ? "circle" : "box";
             }
@@ -722,6 +770,8 @@ export default function App() {
   });
   const boundUnityProjectPath = isEnemy ? enemyUnityProjectPath : characterUnityProjectPath;
   const setBoundUnityProjectPath = isEnemy ? setEnemyUnityProjectPath : setCharacterUnityProjectPath;
+  const [unityPropertyCatalog, setUnityPropertyCatalog] = useState<UnityPropertyCatalogEntry[]>([]);
+  const [unityPropertyCatalogMessage, setUnityPropertyCatalogMessage] = useState("");
   const [characterStatus, setCharacterStatus] = useState(() => characterUnityProjectPath ? "已绑定角色 Unity 项目 · 等待同步" : "角色草稿 · 尚未绑定 Unity");
   const [enemyStatus, setEnemyStatus] = useState(() => enemyUnityProjectPath ? "已绑定敌人 Unity 项目 · 等待同步" : "敌人草稿 · 尚未绑定 Unity");
   const status = isEnemy ? enemyStatus : characterStatus;
@@ -1469,20 +1519,30 @@ export default function App() {
     return nextAssets.map((asset) => asset.id);
   };
 
-  const exportJson = () => {
-    const replacerProject = cleanLegacyProjectData(project);
-    const referencedAssets = collectReferencedAssetIds(replacerProject);
-    const vfxAssetIds = collectVfxAssetIds(replacerProject);
-    const editorAssets = Object.values(assets)
-      .filter((asset) => asset.dataUrl && referencedAssets.has(asset.id))
-      .map(({ id, name, kind, usage, dataUrl, byteSize, sha256, width, height, durationSeconds }) => ({ id, name, kind, usage: usage || (kind === "audio" ? "audio" : vfxAssetIds.has(id) ? "vfx" : "character"), dataUrl, byteSize, sha256, width, height, durationSeconds }));
-    const blob = new Blob([JSON.stringify({ ...replacerProject, editorAssets }, null, 2)], { type: "application/json" });
-    const link = document.createElement("a");
-    link.href = URL.createObjectURL(blob);
-    link.download = `${project.characterName || (isEnemy ? "enemy" : "character")}.${isEnemy ? "frame-action-enemy" : "frame-action"}.json`;
-    link.click();
-    URL.revokeObjectURL(link.href);
-    setStatus("已导出动作数据 JSON");
+  const exportJson = async () => {
+    try {
+      const replacerProject = cleanLegacyProjectData(project);
+      const referencedAssets = collectReferencedAssetIds(replacerProject);
+      const vfxAssetIds = collectVfxAssetIds(replacerProject);
+      const sourceAssets = Object.values(assets).filter((asset) => referencedAssets.has(asset.id));
+      const editorAssets = [];
+      for (let index = 0; index < sourceAssets.length; index += 1) {
+        const { id, name, kind, usage, byteSize, sha256, width, height, durationSeconds } = sourceAssets[index];
+        const dataUrl = sourceAssets[index].dataUrl
+          || (sourceAssets[index].url.startsWith("data:") ? sourceAssets[index].url : await fetchAssetDataUrl(sourceAssets[index]));
+        editorAssets.push({ id, name, kind, usage: usage || (kind === "audio" ? "audio" : vfxAssetIds.has(id) ? "vfx" : "character"), dataUrl, byteSize, sha256, width, height, durationSeconds });
+        if ((index + 1) % 20 === 0) setStatus(`正在整理导出资源 · ${index + 1}/${sourceAssets.length}`);
+      }
+      const blob = new Blob([JSON.stringify({ ...replacerProject, editorAssets }, null, 2)], { type: "application/json" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = `${project.characterName || (isEnemy ? "enemy" : "character")}.${isEnemy ? "frame-action-enemy" : "frame-action"}.json`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+      setStatus("已导出动作数据 JSON");
+    } catch (error) {
+      setStatus(error instanceof Error ? `导出失败 · ${error.message}` : "导出失败");
+    }
   };
 
   const importJson = async (file: File) => {
@@ -1571,6 +1631,27 @@ export default function App() {
     if (!response.ok || result.ok === false) throw new Error(result.message || `请求失败：${response.status}`);
     return result as T;
   };
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!boundUnityProjectPath) {
+      setUnityPropertyCatalog([]);
+      setUnityPropertyCatalogMessage("请先绑定 Unity 项目，再选择可修改属性。");
+      return () => { cancelled = true; };
+    }
+    void postJson<{ ok: true; properties: UnityPropertyCatalogEntry[]; message?: string }>("/api/unity/properties", { projectPath: boundUnityProjectPath })
+      .then((result) => {
+        if (cancelled) return;
+        setUnityPropertyCatalog(result.properties || []);
+        setUnityPropertyCatalogMessage(result.message || (result.properties?.length ? "" : "Unity 尚未生成可修改属性目录。"));
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setUnityPropertyCatalog([]);
+        setUnityPropertyCatalogMessage(error instanceof Error ? error.message : "读取 Unity 属性目录失败");
+      });
+    return () => { cancelled = true; };
+  }, [boundUnityProjectPath]);
 
   const refreshUnityCharacters = async (projectPath: string) => {
     if (!projectPath) return;
@@ -1720,26 +1801,36 @@ export default function App() {
     const referencedAssets = collectReferencedAssetIds(syncProject);
     const vfxAssetIds = collectVfxAssetIds(syncProject);
     const syncAssets = Object.values(assets)
-      .filter((asset) => asset.dataUrl && referencedAssets.has(asset.id))
-      .map((asset) => ({ id: asset.id, name: asset.name, kind: asset.kind, usage: asset.usage || (asset.kind === "audio" ? "audio" : vfxAssetIds.has(asset.id) ? "vfx" : "character"), dataUrl: asset.dataUrl! }));
+      .filter((asset) => referencedAssets.has(asset.id) && Boolean(asset.dataUrl || asset.url))
+      .map((asset) => ({ ...asset, usage: asset.usage || (asset.kind === "audio" ? "audio" : vfxAssetIds.has(asset.id) ? "vfx" : "character") }));
     const preparedAssets: Array<{
       asset: (typeof syncAssets)[number];
-      base64Start: number;
-      base64Length: number;
+      base64Start?: number;
+      base64Length?: number;
       byteSize: number;
       sha256: string;
     }> = [];
     const hashUpdates = new Map<string, { byteSize: number; sha256: string }>();
     for (let assetIndex = 0; assetIndex < syncAssets.length; assetIndex += 1) {
       const asset = syncAssets[assetIndex];
-      const info = inspectBase64DataUrl(asset.dataUrl);
       const cachedAsset = assets[asset.id];
-      const sha256 = isSha256(cachedAsset?.sha256) && cachedAsset.byteSize === info.byteSize
-        ? cachedAsset.sha256.toLowerCase()
-        : await sha256Base64DataUrl(asset.dataUrl, info);
-      preparedAssets.push({ asset, ...info, sha256 });
-      if (cachedAsset?.sha256 !== sha256 || cachedAsset.byteSize !== info.byteSize) {
-        hashUpdates.set(asset.id, { byteSize: info.byteSize, sha256 });
+      let base64Info: ReturnType<typeof inspectBase64DataUrl> | undefined;
+      let byteSize = Number(cachedAsset?.byteSize);
+      let sha256 = isSha256(cachedAsset?.sha256) ? cachedAsset.sha256.toLowerCase() : "";
+      if (asset.dataUrl) {
+        base64Info = inspectBase64DataUrl(asset.dataUrl);
+        byteSize = base64Info.byteSize;
+        sha256 = isSha256(cachedAsset?.sha256) && cachedAsset.byteSize === byteSize
+          ? cachedAsset.sha256.toLowerCase()
+          : await sha256Base64DataUrl(asset.dataUrl, base64Info);
+      } else if (!Number.isSafeInteger(byteSize) || byteSize <= 0 || !sha256) {
+        const bytes = await fetchAssetBytes(asset);
+        byteSize = bytes.byteLength;
+        sha256 = await sha256Bytes(bytes);
+      }
+      preparedAssets.push({ asset, ...base64Info, byteSize, sha256 });
+      if (cachedAsset?.sha256 !== sha256 || cachedAsset.byteSize !== byteSize) {
+        hashUpdates.set(asset.id, { byteSize, sha256 });
       }
       if ((assetIndex + 1) % 20 === 0 || assetIndex + 1 === syncAssets.length) {
         setSyncDialog((current) => current ? {
@@ -1798,8 +1889,7 @@ export default function App() {
       for (let assetIndex = 0; assetIndex < uploadAssets.length; assetIndex += 1) {
         const { asset, base64Start, base64Length, byteSize } = uploadAssets[assetIndex];
         let uploadedBytes = 0;
-        for (let offset = 0; offset < base64Length; offset += ACTOR_ASSET_BASE64_CHUNK_SIZE) {
-          const chunk = decodeBase64Chunk(asset.dataUrl.slice(base64Start + offset, base64Start + Math.min(base64Length, offset + ACTOR_ASSET_BASE64_CHUNK_SIZE)));
+        const uploadChunk = async (chunk: Uint8Array<ArrayBuffer>) => {
           const chunkResponse = await fetch("/api/unity/actor-sync/chunk", {
             method: "POST",
             headers: {
@@ -1819,6 +1909,18 @@ export default function App() {
             phase: "syncing",
             message: `正在上传${actorLabel}资源 ${Math.min(100, progress)}%\n${assetIndex + 1}/${uploadAssets.length} · ${asset.name}`,
           } : current);
+        };
+        if (asset.dataUrl && base64Start !== undefined && base64Length !== undefined) {
+          for (let offset = 0; offset < base64Length; offset += ACTOR_ASSET_BASE64_CHUNK_SIZE) {
+            const chunk = decodeBase64Chunk(asset.dataUrl.slice(base64Start + offset, base64Start + Math.min(base64Length, offset + ACTOR_ASSET_BASE64_CHUNK_SIZE)));
+            await uploadChunk(chunk);
+          }
+        } else {
+          const bytes = await fetchAssetBytes(asset);
+          if (bytes.byteLength !== byteSize) throw new Error(`资源“${asset.name}”大小发生变化，请重新打开后再同步`);
+          for (let offset = 0; offset < bytes.byteLength; offset += ACTOR_ASSET_BINARY_CHUNK_SIZE) {
+            await uploadChunk(bytes.slice(offset, Math.min(bytes.byteLength, offset + ACTOR_ASSET_BINARY_CHUNK_SIZE)));
+          }
         }
         completedBytes += byteSize;
       }
@@ -2328,6 +2430,8 @@ export default function App() {
               tickRate={project.tickRate}
               defaultPixelsPerUnit={project.pixelsPerUnit}
               assets={assets}
+              propertyCatalog={unityPropertyCatalog}
+              propertyCatalogMessage={unityPropertyCatalogMessage}
               onUpdate={(patch) => updateTimelineEvent(selectedTrack.id, selectedTimelineEvent.id, patch)}
               onCreateAssets={createEventAssets}
               onDelete={deleteSelectedEvent}

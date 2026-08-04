@@ -1,0 +1,8 @@
+{
+  "name": "FrameAction.Runtime.Tests",
+  "rootNamespace": "FrameAction.Tests",
+  "references": ["FrameAction.Runtime"],
+  "includePlatforms": ["Editor"],
+  "optionalUnityReferences": ["TestAssemblies"],
+  "autoReferenced": false
+}

@@ -316,7 +316,7 @@ function makeClosedOutline(drawing: MapOutlineData, points: MapPoint[]): MapOutl
 export function finishBrushDrawing(drawing: MapOutlineData, drafts: MapOutlineData[]): BrushFinishResult {
   if (drawing.points.length < 2) return { outline: null, draftOutlines: drafts };
   const points = drawing.points.map(clonePoint);
-  const compatibleDrafts = drafts.filter((draft) => draft.layer === drawing.layer && draft.collisionType === drawing.collisionType);
+  const compatibleDrafts = drafts.filter((draft) => draft.layer === drawing.layer && draft.collisionType === drawing.collisionType && draft.element === drawing.element);
   const graphCycle = findGraphCycle(points, compatibleDrafts);
   if (graphCycle) {
     return {

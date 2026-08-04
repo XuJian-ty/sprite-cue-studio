@@ -54,7 +54,7 @@ async function waitForServer() {
 function createProject(frameAssetId = "asset-a") {
   return {
     format: "frame-action-project",
-    version: 11,
+    version: 12,
     projectKind: "character",
     tickRate: 600,
     pixelsPerUnit: 160,
@@ -123,8 +123,8 @@ before(async () => {
   fs.mkdirSync(runtimeRoot, { recursive: true });
   fs.writeFileSync(path.join(runtimeRoot, "package.json"), JSON.stringify({
     name: "com.frame-action.runtime",
-    version: "0.34.26",
-    frameAction: { schemaMin: 11, schemaMax: 11 },
+    version: "0.35.0",
+    frameAction: { schemaMin: 11, schemaMax: 12 },
   }));
 
   const port = await availablePort();
@@ -160,6 +160,15 @@ test("actor sync uploads only changed resources", async () => {
   const manifest = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
   assert.equal(manifest.assets[0].sha256, firstAsset.sha256);
   assert.equal(manifest.assets[0].byteSize, firstContents.length);
+
+  const loaded = await postJson("/api/unity/load-character", { projectPath: unityRoot, jsonPath: firstFinish.jsonPath });
+  assert.equal(loaded.assets.length, 1);
+  assert.equal(loaded.assets[0].dataUrl, undefined);
+  assert.match(loaded.assets[0].url, /^\/api\/unity\/actor-asset\?/);
+  assert.ok(JSON.stringify(loaded).length < 10_000);
+  const loadedAssetResponse = await fetch(`${baseUrl}${loaded.assets[0].url}`);
+  assert.equal(loadedAssetResponse.ok, true);
+  assert.deepEqual(Buffer.from(await loadedAssetResponse.arrayBuffer()), firstContents);
 
   delete manifest.assets[0].sha256;
   delete manifest.assets[0].byteSize;
@@ -203,4 +212,39 @@ test("actor sync uploads only changed resources", async () => {
   const removeFinish = await finishSync(removeStart.uploadId);
   assert.equal(removeFinish.assetCount, 0);
   assert.equal(fs.existsSync(path.join(path.dirname(jsonPath), "Sprites", "a.png")), false);
+});
+
+test("unity property catalog exposes registered game properties", async () => {
+  const catalogDirectory = path.join(unityRoot, "Library", "FrameActionStudio");
+  fs.mkdirSync(catalogDirectory, { recursive: true });
+  fs.writeFileSync(path.join(catalogDirectory, "property-catalog.json"), JSON.stringify({
+    version: 1,
+    properties: [
+      {
+        id: "stats.attack",
+        displayName: "攻击",
+        category: "基础属性",
+        allowTemporary: true,
+        allowPermanent: true,
+      },
+      {
+        id: "resource.health",
+        displayName: "当前生命",
+        category: "当前资源",
+        allowTemporary: false,
+        allowPermanent: true,
+      },
+    ],
+  }));
+
+  const result = await postJson("/api/unity/properties", { projectPath: unityRoot });
+
+  assert.equal(result.properties.length, 2);
+  assert.deepEqual(result.properties.find((item) => item.id === "stats.attack"), {
+    id: "stats.attack",
+    displayName: "攻击",
+    category: "基础属性",
+    allowTemporary: true,
+    allowPermanent: true,
+  });
 });

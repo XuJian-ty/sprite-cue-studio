@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using Newtonsoft.Json;
 using UnityEditor;
 using UnityEngine;
@@ -12,12 +13,17 @@ namespace FrameAction.Editor
     {
         private const string SourceRoot = "Assets/FrameActionData/Maps";
         private const string PendingImportSessionKey = "FrameAction.PendingMapImports";
+        // Bump this when generated map geometry changes. Existing prefabs are generated assets,
+        // so they need one safe edit-mode import to receive the new contour algorithm.
+        private const string RigidContourRevisionKey = "FrameAction.RigidContourRevision";
+        private const int RigidContourRevision = 6;
 
         static FrameActionMapDataImporter()
         {
             EditorApplication.playModeStateChanged -= OnPlayModeStateChanged;
             EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
             if (!EditorApplication.isPlayingOrWillChangePlaymode) EditorApplication.delayCall += ImportPendingAfterPlayMode;
+            EditorApplication.delayCall += UpgradeRigidContourPrefabs;
         }
 
         [MenuItem("Tools/Frame Action/Import All Map Data")]
@@ -75,7 +81,9 @@ namespace FrameAction.Editor
 
         private static void OnPlayModeStateChanged(PlayModeStateChange state)
         {
-            if (state == PlayModeStateChange.EnteredEditMode) EditorApplication.delayCall += ImportPendingAfterPlayMode;
+            if (state != PlayModeStateChange.EnteredEditMode) return;
+            EditorApplication.delayCall += ImportPendingAfterPlayMode;
+            EditorApplication.delayCall += UpgradeRigidContourPrefabs;
         }
 
         private static void ImportPendingAfterPlayMode()
@@ -85,6 +93,14 @@ namespace FrameAction.Editor
             if (string.IsNullOrEmpty(serialized)) return;
             SessionState.EraseString(PendingImportSessionKey);
             ImportPaths(serialized.Split('|'));
+        }
+
+        private static void UpgradeRigidContourPrefabs()
+        {
+            if (EditorPrefs.GetInt(RigidContourRevisionKey, 0) >= RigidContourRevision) return;
+            if (EditorApplication.isPlayingOrWillChangePlaymode) return;
+            ImportAll();
+            EditorPrefs.SetInt(RigidContourRevisionKey, RigidContourRevision);
         }
 
         private static bool ImportOne(string jsonPath)
@@ -112,7 +128,11 @@ namespace FrameAction.Editor
                     FrameActionMapAssetEntry entry = data.assets[i];
                     if (entry == null || string.IsNullOrEmpty(entry.id) || string.IsNullOrEmpty(entry.path)) continue;
                     string assetPath = $"{sourceFolder}/{entry.path}".Replace("\\", "/");
-                    ConfigureSprite(assetPath, data.pixelsPerUnit, entry.usage == "backgroundTile");
+                    bool needsExactRigidContour = string.Equals(entry.defaultLayer, "rigid", StringComparison.OrdinalIgnoreCase)
+                        || data.objects != null && data.objects.Any(item => item != null
+                            && string.Equals(item.assetId, entry.id, StringComparison.Ordinal)
+                            && string.Equals(item.layer, "rigid", StringComparison.OrdinalIgnoreCase));
+                    ConfigureSprite(assetPath, data.pixelsPerUnit, entry.usage == "backgroundTile", needsExactRigidContour);
                     Sprite sprite = AssetDatabase.LoadAssetAtPath<Sprite>(assetPath);
                     if (sprite != null) sprites[entry.id] = sprite;
                 }
@@ -131,7 +151,7 @@ namespace FrameAction.Editor
             return true;
         }
 
-        private static void ConfigureSprite(string assetPath, float pixelsPerUnit, bool losslessBackgroundTile)
+        private static void ConfigureSprite(string assetPath, float pixelsPerUnit, bool losslessBackgroundTile, bool needsExactRigidContour)
         {
             TextureImporter importer = AssetImporter.GetAtPath(assetPath) as TextureImporter;
             if (importer == null) return;
@@ -148,6 +168,7 @@ namespace FrameAction.Editor
                 || importer.mipmapEnabled
                 || (needsPhysicsShape && (settings.spriteMeshType != SpriteMeshType.Tight
                     || !settings.spriteGenerateFallbackPhysicsShape))
+                || (needsExactRigidContour && !importer.isReadable)
                 || (losslessBackgroundTile && (importer.maxTextureSize != 4096
                     || importer.textureCompression != TextureImporterCompression.Uncompressed
                     || importer.filterMode != FilterMode.Bilinear
@@ -167,6 +188,7 @@ namespace FrameAction.Editor
             importer.spritePixelsPerUnit = ppu;
             importer.alphaIsTransparency = true;
             importer.mipmapEnabled = false;
+            if (needsExactRigidContour) importer.isReadable = true;
             if (losslessBackgroundTile)
             {
                 importer.maxTextureSize = 4096;
